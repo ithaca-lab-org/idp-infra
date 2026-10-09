@@ -14,3 +14,9 @@ variable "zone" {
   type        = string
   default     = "us-central1-a"
 }
+
+variable "authorized_networks" {
+  description = "Name to CIDR map allowed to reach the GKE API endpoint (your laptop's /32)."
+  type        = map(string)
+  default     = {}
+}

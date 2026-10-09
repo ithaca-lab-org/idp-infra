@@ -28,7 +28,7 @@ jobs:
         run: terraform fmt -check -recursive
       - name: validate
         run: |
-          for d in bootstrap envs/dev; do
+          for d in bootstrap envs/persistent envs/dev; do
             terraform -chdir="$d" init -backend=false -input=false
             terraform -chdir="$d" validate
           done
@@ -73,8 +73,12 @@ jobs:
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_PLAN_SA }}
-      - name: plan envs/dev
-        working-directory: envs/dev
+      # envs/dev is planned locally (`make plan ENV=envs/dev`): it reads the KMS key
+      # that envs/persistent creates, so it cannot plan before that stack is applied.
+      - name: plan envs/persistent
+        working-directory: envs/persistent
+        env:
+          TF_VAR_billing_account_id: ${{ vars.BILLING_ACCOUNT_ID }}
         run: |
           terraform init -input=false
           terraform plan -input=false -no-color -lock-timeout=60s | tee plan.txt
@@ -84,11 +88,11 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const p = 'envs/dev/plan.txt';
+            const p = 'envs/persistent/plan.txt';
             const body = fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : 'plan did not produce output';
             const trimmed = body.length > 60000 ? body.slice(-60000) : body;
-            const marker = '<!-- terraform-plan-envs-dev -->';
-            const text = marker + '\n### terraform plan (envs/dev)\n```\n' + trimmed + '\n```';
+            const marker = '<!-- terraform-plan-envs-persistent -->';
+            const text = marker + '\n### terraform plan (envs/persistent)\n```\n' + trimmed + '\n```';
             const { data: comments } = await github.rest.issues.listComments({
               ...context.repo, issue_number: context.issue.number,
             });
