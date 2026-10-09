@@ -10,5 +10,6 @@ Part of the ithaca IDP. Architecture and decisions live in `../IDP_NOTES.md` (se
 - No service-account JSON keys, ever. CI uses Workload Identity Federation; pods use Workload Identity.
 - `bootstrap/` is applied once by a human from a laptop. CI only runs `envs/*`.
 - Keep the state bucket and Artifact Registry outside anything `make down` destroys.
-- Changes go through a PR to `main`; `main` applies automatically. Use conventional commits.
+- Two stacks: `envs/persistent` (KMS, registry, DNS, budget) is applied by CI on merge; `envs/dev` (network, GKE) is human-only via `make up` / `make down` (ADR 0004).
+- Changes go through a PR to `main`. Use conventional commits.
 - No secrets, passwords or account IDs in docs or code that don't already appear in tfvars. Never commit `idp_details.rtf`.

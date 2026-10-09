@@ -13,7 +13,7 @@ Terraform for the ithaca Internal Developer Platform on GKE (Standard, zonal, Sp
 - **Pull request:** fmt, validate, tflint, checkov, then `terraform plan` as the read-only `terraform-plan` service account; the plan is posted as a PR comment.
 - **Merge to `main`:** `terraform apply` as `terraform-apply`, which only federation from `refs/heads/main` can use.
 
-Required repository **variables** (not secrets; no keys exist): `GCP_WIF_PROVIDER`, `GCP_PLAN_SA`, `GCP_APPLY_SA`. Values come from `terraform output` in `bootstrap/`.
+Required repository **variables** (not secrets; no keys exist): `GCP_WIF_PROVIDER`, `GCP_PLAN_SA`, `GCP_APPLY_SA`, `BILLING_ACCOUNT_ID`. Values come from `terraform output` in `bootstrap/`.
 
 ## Repo hygiene
 

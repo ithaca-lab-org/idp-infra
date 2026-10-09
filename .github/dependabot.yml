@@ -4,6 +4,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "ci"
     groups:
@@ -12,9 +14,12 @@ updates:
   - package-ecosystem: terraform
     directories:
       - /bootstrap
+      - /envs/persistent
       - /envs/dev
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "build"
     groups:

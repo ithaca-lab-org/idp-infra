@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
+      actions: read # required by CodeQL on private repos
       contents: read
       security-events: write
     steps:

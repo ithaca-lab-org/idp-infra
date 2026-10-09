@@ -36,8 +36,12 @@ jobs:
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_APPLY_SA }}
-      - name: apply envs/dev
-        working-directory: envs/dev
+      # envs/dev (network + GKE) is applied by a human with `make up` so the
+      # cluster never starts billing as a side effect of a merge.
+      - name: apply envs/persistent
+        working-directory: envs/persistent
+        env:
+          TF_VAR_billing_account_id: ${{ vars.BILLING_ACCOUNT_ID }}
         run: |
           terraform init -input=false
           terraform apply -input=false -auto-approve -lock-timeout=60s
