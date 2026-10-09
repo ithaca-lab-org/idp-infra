@@ -1,0 +1,22 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: terraform
+    directories:
+      - /bootstrap
+      - /envs/dev
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "build"
+    groups:
+      terraform:
+        patterns: ["*"]

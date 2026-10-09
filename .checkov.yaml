@@ -1,0 +1,7 @@
+framework:
+  - terraform
+  - github_actions
+quiet: true
+compact: true
+skip-path:
+  - ".terraform"
