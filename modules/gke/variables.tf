@@ -45,7 +45,7 @@ variable "master_cidr" {
 }
 
 variable "authorized_networks" {
-  description = "Map of display name to CIDR allowed to reach the public API endpoint, e.g. { laptop = \"203.0.113.7/32\" }. Empty means nobody outside Google's control plane."
+  description = "Optional map of display name to CIDR allowed to reach the public IP endpoint, e.g. { laptop = \"203.0.113.7/32\" }. Not needed for the DNS endpoint, which is gated by IAM."
   type        = map(string)
   default     = {}
 }
@@ -69,9 +69,9 @@ variable "initial_node_count" {
 }
 
 variable "min_nodes" {
-  description = "Autoscaler minimum (0 lets the pool scale to zero overnight)."
+  description = "Autoscaler minimum. Keep at 1: with 0, kube-dns and other system pods leave the cluster with no recovery path after a Spot preemption."
   type        = number
-  default     = 0
+  default     = 1
 }
 
 variable "max_nodes" {
