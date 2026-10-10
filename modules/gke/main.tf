@@ -45,6 +45,11 @@ resource "google_container_cluster" "this" {
     service_account = google_service_account.nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
 
+    # GKE reports spot = true at the cluster level once the default pool is
+    # removed (it mirrors the remaining Spot pool). Leaving this false makes
+    # every plan try to replace the cluster.
+    spot = true
+
     workload_metadata_config {
       mode = "GKE_METADATA"
     }
