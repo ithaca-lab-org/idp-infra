@@ -1,11 +1,7 @@
 locals {
-  node_sa_roles = [
-    "roles/logging.logWriter",
-    "roles/monitoring.metricWriter",
-    "roles/monitoring.viewer",
-    "roles/stackdriver.resourceMetadata.writer",
-    "roles/artifactregistry.reader",
-  ]
+  # Google's purpose-built node role (logging, monitoring, autoscaling metrics,
+  # resource metadata). Registry read access is granted per repository in envs/dev.
+  node_sa_roles = ["roles/container.defaultNodeServiceAccount"]
 }
 
 # Dedicated least-privilege node identity (never the default Compute SA).
@@ -24,7 +20,7 @@ resource "google_project_iam_member" "nodes" {
 
 resource "google_container_cluster" "this" {
   # checkov:skip=CKV_GCP_24:PodSecurityPolicy is removed from GKE; Pod Security Admission and Kyverno enforce policy instead (Step 6 / Phase 4).
-  # checkov:skip=CKV_GCP_25:Zonal by design (free-tier management fee, see IDP_NOTES section 4); not a private-endpoint cluster so CI and laptops can reach it via authorized networks.
+  # checkov:skip=CKV_GCP_25:Zonal by design (free-tier management fee, see IDP_NOTES section 4); public endpoint is kept off the allowlist path: CI and laptops use the IAM-gated DNS endpoint (control_plane_endpoints_config).
   # checkov:skip=CKV_GCP_66:Binary Authorization is replaced by Cosign + Kyverno admission verification (Phase 5).
   # checkov:skip=CKV_GCP_69:Workload Identity (GKE_METADATA) is enabled on the node pool; checkov cannot see it across resources.
   # checkov:skip=CKV_GCP_12:Network policy is enforced by Dataplane V2 (ADVANCED_DATAPATH), not the legacy Calico addon.
@@ -39,9 +35,32 @@ resource "google_container_cluster" "this" {
   network    = var.network_id
   subnetwork = var.subnetwork_id
 
-  # The default pool is replaced by the managed Spot pool below.
+  # The default pool is replaced by the managed Spot pool below. It still boots
+  # briefly, so give it the dedicated node identity instead of the default
+  # Compute service account.
   remove_default_node_pool = true
   initial_node_count       = 1
+
+  node_config {
+    service_account = google_service_account.nodes.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    shielded_instance_config {
+      enable_secure_boot          = true
+      enable_integrity_monitoring = true
+    }
+  }
+
+  # Turn off the unauthenticated kubelet read-only port (10255) on all pools.
+  node_pool_defaults {
+    node_config_defaults {
+      insecure_kubelet_readonly_port_enabled = "FALSE"
+    }
+  }
 
   release_channel {
     channel = "REGULAR"
@@ -58,6 +77,14 @@ resource "google_container_cluster" "this" {
     enable_private_nodes    = true
     enable_private_endpoint = false
     master_ipv4_cidr_block  = var.master_cidr
+  }
+
+  # IAM-gated DNS endpoint: reachable from laptops and CI without IP allowlists.
+  # Use `gcloud container clusters get-credentials --dns-endpoint`.
+  control_plane_endpoints_config {
+    dns_endpoint_config {
+      allow_external_traffic = true
+    }
   }
 
   master_authorized_networks_config {
@@ -103,9 +130,11 @@ resource "google_container_cluster" "this" {
 
   maintenance_policy {
     recurring_window {
+      # GKE requires >= 48h of maintenance availability in any rolling 32 days.
+      # 4h daily is ~128h; weekend-only 4h windows would be ~36h and fail.
       start_time = "2026-01-01T08:00:00Z"
       end_time   = "2026-01-01T12:00:00Z"
-      recurrence = "FREQ=WEEKLY;BYDAY=SA,SU"
+      recurrence = "FREQ=DAILY"
     }
   }
 
@@ -149,5 +178,21 @@ resource "google_container_node_pool" "spot" {
       enable_secure_boot          = true
       enable_integrity_monitoring = true
     }
+  }
+}
+
+# The control plane reaches nodes only on 443/10250 by default. Admission
+# webhooks (istiod 15017, Kyverno 9443) need explicit access from the master range.
+resource "google_compute_firewall" "master_webhooks" {
+  name      = "${var.name}-master-webhooks"
+  network   = var.network_id
+  direction = "INGRESS"
+  priority  = 1000
+
+  source_ranges = [var.master_cidr]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["15017", "9443"]
   }
 }
