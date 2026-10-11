@@ -9,7 +9,7 @@ The platform has many add-ons (cert-manager, Istio, Tailscale, later Vault, Keyc
 
 ## Decision
 
-- **Terraform installs Argo CD only** (`modules/argocd`, the one `helm_release` it owns) and creates a single root Application. Everything else is declared in the separate `idp-gitops` repo and installed by Argo CD.
+- **Terraform installs Argo CD only** (`modules/argocd`: the `argo-cd` release plus a second `argocd-apps` release for the root Application, the only Helm releases it owns) and creates a single root Application. Everything else is declared in the separate `idp-gitops` repo and installed by Argo CD.
 - **App-of-apps with sync waves:** the root Application syncs `idp-gitops/apps/`; each child Application carries a `sync-wave` (cert-manager 1; Istio and Tailscale 2; echo app 3; later phases after that).
 - **Automated sync with prune and self-heal on `main`.** A merge to `idp-gitops` is a deploy; PR review is the control.
 - Upstream Helm charts are referenced with pinned versions and values live in the repo (multi-source Applications), so every change is a reviewable diff.

@@ -4,6 +4,12 @@ variable "chart_version" {
   default     = "10.10.2"
 }
 
+variable "apps_chart_version" {
+  description = "argocd-apps Helm chart version (creates the root Application). Pinned on purpose."
+  type        = string
+  default     = "2.0.6"
+}
+
 variable "namespace" {
   description = "Namespace for Argo CD and the root Application."
   type        = string

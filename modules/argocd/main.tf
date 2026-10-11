@@ -1,17 +1,13 @@
-# The one helm_release Terraform owns. Everything else is installed by Argo CD
-# from idp-gitops, starting from the root Application created here.
+# Terraform installs Argo CD and the root Application, and nothing else. Every
+# other add-on is installed by Argo CD from idp-gitops.
 locals {
+  # Map shape expected by the argocd-apps chart.
   root_app = {
-    apiVersion = "argoproj.io/v1alpha1"
-    kind       = "Application"
-    metadata = {
-      name      = "root"
+    root = {
       namespace = var.namespace
+      project   = "default"
       # No resource finalizer on purpose: with one, `make down` deadlocks because
       # Argo CD is removed before it can process the finalizer.
-    }
-    spec = {
-      project = "default"
       source = {
         repoURL        = var.gitops_repo_url
         targetRevision = var.gitops_revision
@@ -43,8 +39,6 @@ locals {
     repoServer     = { resources = local.small }
     applicationSet = { resources = local.small }
     redis          = { resources = { requests = { cpu = "10m", memory = "32Mi" } } }
-
-    extraObjects = [local.root_app]
   }
 }
 
@@ -60,4 +54,23 @@ resource "helm_release" "argocd" {
   timeout = 600
 
   values = [yamlencode(local.values)]
+}
+
+# The root Application is a separate release because Helm validates every object
+# in a release against the API *before* installing it, so an Application cannot
+# live in the same release that installs the Application CRD (extraObjects fails
+# with "no matches for kind Application").
+resource "helm_release" "root_app" {
+  name       = "argocd-root"
+  repository = "https://argoproj.github.io/argo-helm"
+  chart      = "argocd-apps"
+  version    = var.apps_chart_version
+  namespace  = var.namespace
+
+  wait    = true
+  timeout = 300
+
+  values = [yamlencode({ applications = local.root_app })]
+
+  depends_on = [helm_release.argocd]
 }
