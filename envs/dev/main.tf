@@ -42,3 +42,12 @@ resource "google_artifact_registry_repository_iam_member" "nodes_pull" {
   role       = "roles/artifactregistry.reader"
   member     = "serviceAccount:${module.gke.node_service_account}"
 }
+
+module "argocd" {
+  source = "../../modules/argocd"
+
+  gitops_repo_url = "https://github.com/ithaca-lab-org/idp-gitops.git"
+
+  # The node pool must exist before Argo CD pods can schedule.
+  depends_on = [module.gke, google_artifact_registry_repository_iam_member.nodes_pull]
+}

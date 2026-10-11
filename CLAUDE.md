@@ -11,5 +11,6 @@ Part of the ithaca IDP. Architecture and decisions live in `../IDP_NOTES.md` (se
 - `bootstrap/` is applied once by a human from a laptop. CI only runs `envs/*`.
 - Keep the state bucket and Artifact Registry outside anything `make down` destroys.
 - Two stacks: `envs/persistent` (KMS, registry, DNS, budget) is applied by CI on merge; `envs/dev` (network, GKE) is human-only via `make up` / `make down` (ADR 0004).
+- Terraform installs Argo CD only (`modules/argocd`); add-ons live in the `idp-gitops` repo (ADR 0003). Do not add more `helm_release` resources here.
 - Changes go through a PR to `main`. Use conventional commits.
 - No secrets, passwords or account IDs in docs or code that don't already appear in tfvars. Never commit `idp_details.rtf`.
