@@ -2,7 +2,8 @@
 # Post-build checks, run by `make up` and by hand (`make verify`). Deterministic:
 # exits non-zero on the first failing check after a polling timeout.
 # Checks: (1) every Argo CD Application is Synced and Healthy;
-#         (2) cert-manager is available; (3) echo app Certificate Ready and HTTPS 200 (once the app exists).
+#         (2) the Tailscale operator is available; (3) cert-manager is available;
+#         (4) echo app Certificate Ready and HTTPS 200 (once the app exists).
 set -euo pipefail
 
 PROJECT="${PROJECT_ID:-project-324502ff-9928-4b17-a89}"
@@ -42,14 +43,20 @@ while :; do
   sleep "$INTERVAL"
 done
 
-# --- 2. cert-manager ---------------------------------------------------------
+# --- 2. Tailscale operator (wave 2) ------------------------------------------
+# Needs Secret tailscale/operator-oauth from scripts/bootstrap-secrets.sh; without it the Pod never starts.
+kubectl -n tailscale wait --for=condition=Available deployment/operator --timeout=180s >/dev/null \
+  || fail "deployment operator in tailscale is not Available (Secret tailscale/operator-oauth missing? run ./scripts/bootstrap-secrets.sh)"
+pass "Tailscale operator deployment is Available"
+
+# --- 3. cert-manager ---------------------------------------------------------
 for d in cert-manager cert-manager-webhook cert-manager-cainjector; do
   kubectl -n cert-manager wait --for=condition=Available "deployment/$d" --timeout=120s >/dev/null \
     || fail "deployment $d in cert-manager is not Available"
 done
 pass "cert-manager deployments are Available"
 
-# --- 3. echo app (added in wave 3) -------------------------------------------
+# --- 4. echo app (added in wave 3) -------------------------------------------
 if kubectl get applications.argoproj.io echo -n argocd >/dev/null 2>&1; then
   kubectl -n echo wait --for=condition=Ready certificate --all --timeout=300s >/dev/null \
     || fail "echo Certificate is not Ready"

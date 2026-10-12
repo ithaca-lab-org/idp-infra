@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Run by `make up` after `terraform apply` and before verify.sh. Copies the bootstrap
+# secrets that cannot live in Git from Google Secret Manager into the fresh cluster:
+#   Secret Manager tailscale-oauth-client-id / -secret  ->  Secret tailscale/operator-oauth
+#                                                           (keys client_id, client_secret)
+# The Tailscale operator (idp-gitops, wave 2) mounts that Secret by name; its Pod waits in
+# ContainerCreating until it exists. Idempotent: safe to re-run, and re-running after a
+# rotation updates the Secret. Never prints secret values. See docs/tailscale.md.
+# Replaced by External Secrets in a later phase (ADR 0005).
+set -euo pipefail
+set +x # never trace: the values below must not reach the terminal or CI logs
+
+PROJECT="${PROJECT_ID:-project-324502ff-9928-4b17-a89}"
+ZONE="${ZONE:-us-central1-a}"
+CLUSTER="${CLUSTER:-idp}"
+TS_NAMESPACE="${TS_NAMESPACE:-tailscale}"
+TS_K8S_SECRET="operator-oauth" # fixed by the tailscale-operator chart (1.102.x)
+SM_CLIENT_ID="${TS_OAUTH_CLIENT_ID_SECRET:-tailscale-oauth-client-id}"
+SM_CLIENT_SECRET="${TS_OAUTH_CLIENT_SECRET_SECRET:-tailscale-oauth-client-secret}"
+
+die() { printf 'bootstrap-secrets: %s\n' "$*" >&2; exit 1; }
+
+for tool in gcloud kubectl; do
+  command -v "$tool" >/dev/null 2>&1 || die "$tool not found on PATH"
+done
+
+# Values only ever live in this private temp dir and in shell variables, never in argv
+# (so not in `ps`) and never on stdout.
+umask 077
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/bootstrap-secrets.XXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+
+# read_secret <secret-manager-name> <output-file>
+read_secret() {
+  local name="$1" out="$2" value
+  if ! value="$(gcloud secrets versions access latest --secret="$name" --project="$PROJECT" 2>"$tmp/err")"; then
+    if grep -q 'NOT_FOUND' "$tmp/err"; then
+      die "secret '$name' (or an enabled version of it) not found in project $PROJECT. Create it first, see docs/tailscale.md."
+    elif grep -q 'PERMISSION_DENIED' "$tmp/err"; then
+      die "no access to secret '$name' in project $PROJECT. You need roles/secretmanager.secretAccessor (check 'gcloud auth list')."
+    fi
+    die "could not read secret '$name' from project $PROJECT: $(head -n 1 "$tmp/err")"
+  fi
+  [ -n "$value" ] || die "secret '$name' in project $PROJECT is empty"
+  printf '%s' "$value" >"$out"
+}
+
+read_secret "$SM_CLIENT_ID" "$tmp/client_id"
+read_secret "$SM_CLIENT_SECRET" "$tmp/client_secret"
+echo "bootstrap-secrets: read $SM_CLIENT_ID and $SM_CLIENT_SECRET from Secret Manager"
+
+# Idempotent: makes sure kubectl points at this cluster (through the DNS endpoint).
+gcloud container clusters get-credentials "$CLUSTER" --dns-endpoint --zone "$ZONE" --project "$PROJECT" >/dev/null 2>&1 \
+  || die "could not get credentials for $CLUSTER (needs gcloud with --dns-endpoint support)"
+
+# Argo CD also creates this namespace (CreateNamespace=true); whichever runs first wins.
+# No istio.io/dataplane-mode label here: the operator and its proxies stay outside the ambient mesh.
+kubectl create namespace "$TS_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+  || die "could not create namespace $TS_NAMESPACE"
+
+# The dry-run output contains the (base64) values, so it only ever goes through the pipe.
+kubectl -n "$TS_NAMESPACE" create secret generic "$TS_K8S_SECRET" \
+  --from-file=client_id="$tmp/client_id" \
+  --from-file=client_secret="$tmp/client_secret" \
+  --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+  || die "could not create or update Secret $TS_NAMESPACE/$TS_K8S_SECRET"
+
+echo "bootstrap-secrets ok: Secret $TS_NAMESPACE/$TS_K8S_SECRET is in place (values not shown)"
