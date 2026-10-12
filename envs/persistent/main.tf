@@ -20,6 +20,21 @@ module "dns" {
   domain = var.domain
 }
 
+module "ingress" {
+  source = "../../modules/ingress"
+
+  region    = var.region
+  domain    = var.domain
+  zone_name = module.dns.zone_name
+}
+
+module "cert_manager_dns" {
+  source = "../../modules/cert-manager-dns"
+
+  project_id = var.project_id
+  zone_name  = module.dns.zone_name
+}
+
 module "budget" {
   source = "../../modules/budget"
 
