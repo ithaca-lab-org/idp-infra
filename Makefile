@@ -28,6 +28,7 @@ up: ## build the destroyable platform (human only)
 	./scripts/precheck.sh
 	terraform -chdir=$(ENV) init -input=false
 	terraform -chdir=$(ENV) apply
+	./scripts/bootstrap-secrets.sh
 	./scripts/verify.sh
 
 down: ## tear down network + GKE; persistent stack stays (human only)
