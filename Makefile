@@ -25,6 +25,7 @@ plan: ## terraform plan for $(ENV) (envs/dev or envs/persistent)
 # up/down are for humans only (see CLAUDE.md) and only touch envs/dev (network + GKE).
 # envs/persistent (KMS, registry, DNS, budget) is applied by CI on merge to main.
 up: ## build the destroyable platform (human only)
+	./scripts/precheck.sh
 	terraform -chdir=$(ENV) init -input=false
 	terraform -chdir=$(ENV) apply
 	./scripts/verify.sh

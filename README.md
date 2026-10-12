@@ -5,7 +5,7 @@ Terraform for the ithaca Internal Developer Platform on GKE (Standard, zonal, Sp
 | Path | Purpose |
 |---|---|
 | `bootstrap/` | One-time stack: APIs, state bucket, GitHub OIDC federation, plan/apply service accounts |
-| `modules/` | `network`, `gke`, `registry`, `dns`, `budget` (added in Phase 0, Step 5) |
+| `modules/` | `network`, `gke`, `kms`, `registry`, `dns`, `budget`, `argocd` |
 | `envs/dev/` | The environment CI plans on PRs and applies on merge to `main` |
 
 ## CI

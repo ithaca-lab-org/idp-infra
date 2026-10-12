@@ -5,5 +5,5 @@ output "cluster_name" {
 
 output "get_credentials" {
   description = "Command that configures kubectl."
-  value       = "gcloud container clusters get-credentials ${module.gke.name} --zone ${var.zone} --project ${var.project_id}"
+  value       = "gcloud container clusters get-credentials ${module.gke.name} --dns-endpoint --zone ${var.zone} --project ${var.project_id}"
 }
