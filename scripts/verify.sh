@@ -3,7 +3,7 @@
 # exits non-zero on the first failing check after a polling timeout.
 # Checks: (1) every Argo CD Application is Synced and Healthy;
 #         (2) the Tailscale operator is available; (3) cert-manager is available;
-#         (4) echo app Certificate Ready and HTTPS 200 (once the app exists).
+#         (4) echo app: wildcard Certificate Ready, DNS -> reserved IP, HTTPS 200 (once the app exists).
 set -euo pipefail
 
 PROJECT="${PROJECT_ID:-project-324502ff-9928-4b17-a89}"
@@ -56,16 +56,40 @@ for d in cert-manager cert-manager-webhook cert-manager-cainjector; do
 done
 pass "cert-manager deployments are Available"
 
-# --- 4. echo app (added in wave 3) -------------------------------------------
+# --- 4. echo app (wave 7) ----------------------------------------------------
 if kubectl get applications.argoproj.io echo -n argocd >/dev/null 2>&1; then
-  kubectl -n echo wait --for=condition=Ready certificate --all --timeout=300s >/dev/null \
-    || fail "echo Certificate is not Ready"
-  pass "echo Certificate is Ready"
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://echo.apps.${DOMAIN}")"
-  [ "$code" = "200" ] || fail "https://echo.apps.${DOMAIN} returned HTTP $code"
-  pass "https://echo.apps.${DOMAIN} returned 200"
+  HOST="echo.apps.${DOMAIN}"
+  REGION="${REGION:-us-central1}"
+
+  # 4a. wildcard certificate issued (staging by default, see ADR 0006)
+  kubectl -n istio-ingress wait --for=condition=Ready certificate/wildcard-apps --timeout=300s >/dev/null \
+    || fail "Certificate wildcard-apps in istio-ingress is not Ready (kubectl -n istio-ingress describe certificate wildcard-apps)"
+  issuer="$(kubectl -n istio-ingress get certificate wildcard-apps -o jsonpath='{.spec.issuerRef.name}')"
+  pass "wildcard certificate is Ready (issuer: $issuer)"
+
+  # 4b. DNS points at the reserved ingress IP
+  want_ip="${INGRESS_IP:-$(gcloud compute addresses describe idp-ingress --region "$REGION" --project "$PROJECT" --format='value(address)' 2>/dev/null || true)}"
+  [ -n "$want_ip" ] || fail "could not determine the reserved ingress IP (set INGRESS_IP or check gcloud access)"
+  got_ip="$(dig +short "$HOST" @8.8.8.8 | tail -n 1)"
+  [ "$got_ip" = "$want_ip" ] || fail "$HOST resolves to '${got_ip:-nothing}', expected $want_ip"
+  pass "$HOST resolves to the reserved ingress IP $want_ip"
+
+  # 4c. HTTPS 200. The staging CA is not in any trust store, so use -k and say so.
+  curl_opts=(-s -o /dev/null -w '%{http_code}' --max-time 20)
+  case "$issuer" in
+    *staging*) curl_opts+=(-k); note=" (certificate is from the Let's Encrypt STAGING CA, so TLS trust was not checked)" ;;
+    *) note="" ;;
+  esac
+  deadline=$((SECONDS + 300)) # the load balancer can lag the Gateway by a few minutes
+  while :; do
+    code="$(curl "${curl_opts[@]}" "https://${HOST}" || true)"
+    [ "$code" = "200" ] && break
+    [ "$SECONDS" -ge "$deadline" ] && fail "https://${HOST} returned HTTP ${code:-none} after 300s"
+    sleep 10
+  done
+  pass "https://${HOST} returned 200${note}"
 else
-  skip "echo app not deployed yet (wave 3)"
+  skip "echo app not deployed yet (wave 7)"
 fi
 
 echo "verify.sh: all checks passed"
