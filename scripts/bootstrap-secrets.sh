@@ -6,6 +6,8 @@
 # The Tailscale operator (idp-gitops, wave 2) mounts that Secret by name; its Pod waits in
 # ContainerCreating until it exists. Idempotent: safe to re-run, and re-running after a
 # rotation updates the Secret. Never prints secret values. See docs/tailscale.md.
+# Identity secrets (lldap, Keycloak admin, Keycloak DB) are generated into Secret Manager on
+# first run (random, never printed) and copied into the identity namespace. See docs/identity.md.
 # Replaced by External Secrets in a later phase (ADR 0005).
 set -euo pipefail
 set +x # never trace: the values below must not reach the terminal or CI logs
@@ -66,3 +68,51 @@ kubectl -n "$TS_NAMESPACE" create secret generic "$TS_K8S_SECRET" \
   || die "could not create or update Secret $TS_NAMESPACE/$TS_K8S_SECRET"
 
 echo "bootstrap-secrets ok: Secret $TS_NAMESPACE/$TS_K8S_SECRET is in place (values not shown)"
+
+# --- identity namespace (lldap, Keycloak, Keycloak Postgres) ---------------------------------
+ID_NAMESPACE="${ID_NAMESPACE:-identity}"
+
+# ensure_secret <secret-manager-name>: creates the secret with a random 64-char hex value if it
+# has no enabled version yet. The value goes through a pipe only, never argv, never stdout.
+ensure_secret() {
+  local name="$1"
+  if gcloud secrets versions access latest --secret="$name" --project="$PROJECT" >/dev/null 2>"$tmp/err"; then
+    return 0
+  fi
+  grep -q 'NOT_FOUND' "$tmp/err" || die "cannot read secret '$name': $(head -n 1 "$tmp/err")"
+  if ! gcloud secrets describe "$name" --project="$PROJECT" >/dev/null 2>&1; then
+    gcloud secrets create "$name" --replication-policy=automatic --project="$PROJECT" >/dev/null 2>"$tmp/err" \
+      || die "could not create secret '$name': $(head -n 1 "$tmp/err")"
+  fi
+  openssl rand -hex 32 | gcloud secrets versions add "$name" --data-file=- --project="$PROJECT" >/dev/null 2>"$tmp/err" \
+    || die "could not add a version to secret '$name': $(head -n 1 "$tmp/err")"
+  echo "bootstrap-secrets: generated $name in Secret Manager"
+}
+
+command -v openssl >/dev/null 2>&1 || die "openssl not found on PATH"
+for s in lldap-admin-password lldap-jwt-secret lldap-key-seed keycloak-admin-password keycloak-db-password; do
+  ensure_secret "$s"
+  read_secret "$s" "$tmp/$s"
+done
+
+kubectl create namespace "$ID_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+  || die "could not create namespace $ID_NAMESPACE"
+
+# apply_secret <k8s-name> <key>=<file>...  (dry-run output holds base64 values: pipe only)
+apply_secret() {
+  local name="$1"; shift
+  local args=() kv
+  for kv in "$@"; do args+=(--from-file="${kv%%=*}=${kv#*=}"); done
+  kubectl -n "$ID_NAMESPACE" create secret generic "$name" "${args[@]}" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+    || die "could not create or update Secret $ID_NAMESPACE/$name"
+}
+
+apply_secret lldap \
+  "admin-password=$tmp/lldap-admin-password" \
+  "jwt-secret=$tmp/lldap-jwt-secret" \
+  "key-seed=$tmp/lldap-key-seed"
+apply_secret keycloak-admin "password=$tmp/keycloak-admin-password"
+apply_secret keycloak-db "password=$tmp/keycloak-db-password"
+
+echo "bootstrap-secrets ok: Secrets $ID_NAMESPACE/{lldap,keycloak-admin,keycloak-db} are in place (values not shown)"
