@@ -14,3 +14,18 @@
 - Read a value yourself when you need to log in: `gcloud secrets versions access latest --secret=keycloak-admin-password`.
 - To rotate, add a new version in Secret Manager and re-run the script; the pods read the Secret at start, so restart them (or run `make down` / `make up`).
 - External Secrets replaces this script in a later phase (ADR 0005).
+
+## Exposure and the optional `tailnet-domain` secret
+
+Public: only `https://auth.apps.ithaca-idp.com/realms/ithaca/*` and `/resources/*` (ADR 0007). Private: the Keycloak admin console (`https://keycloak-admin.<tailnet>.ts.net`) and the lldap UI (`https://lldap-admin.<tailnet>.ts.net`), through the Tailscale operator.
+
+Keycloak must know its admin URL, and the tailnet name is kept out of this public repo. Store it once, then the next `make up` (or `./scripts/bootstrap-secrets.sh`) sets `KC_HOSTNAME_ADMIN`:
+
+```bash
+P=project-324502ff-9928-4b17-a89
+gcloud secrets create tailnet-domain --replication-policy=automatic --project="$P"
+read -rp "tailnet domain (for example tail1234.ts.net): " v
+printf '%s' "$v" | gcloud secrets versions add tailnet-domain --data-file=- --project="$P"
+```
+
+Without it the script prints a notice and the admin console is only reachable through `kubectl -n identity port-forward svc/keycloak-http 8080:80`.

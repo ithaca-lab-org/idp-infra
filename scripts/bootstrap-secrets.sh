@@ -112,7 +112,19 @@ apply_secret lldap \
   "admin-password=$tmp/lldap-admin-password" \
   "jwt-secret=$tmp/lldap-jwt-secret" \
   "key-seed=$tmp/lldap-key-seed"
-apply_secret keycloak-admin "password=$tmp/keycloak-admin-password"
+
+# Optional: the tailnet domain (for example tail1234.ts.net) stays out of Git. If the Secret Manager
+# secret "tailnet-domain" exists, Keycloak gets its admin console URL (KC_HOSTNAME_ADMIN) from it.
+admin_url=()
+if tailnet="$(gcloud secrets versions access latest --secret=tailnet-domain --project="$PROJECT" 2>/dev/null)"; then
+  tailnet="$(printf '%s' "$tailnet" | tr -d '[:space:]')"
+  [[ "$tailnet" =~ ^[a-z0-9-]+(\.[a-z0-9-]+)*\.ts\.net$ ]] || die "secret tailnet-domain is not a *.ts.net name"
+  printf 'https://keycloak-admin.%s' "$tailnet" >"$tmp/keycloak-admin-url"
+  admin_url=("admin-url=$tmp/keycloak-admin-url")
+else
+  echo "bootstrap-secrets: no tailnet-domain secret; Keycloak admin console is not reachable over Tailscale (docs/identity.md)"
+fi
+apply_secret keycloak-admin "password=$tmp/keycloak-admin-password" ${admin_url[@]+"${admin_url[@]}"}
 apply_secret keycloak-db "password=$tmp/keycloak-db-password"
 
 echo "bootstrap-secrets ok: Secrets $ID_NAMESPACE/{lldap,keycloak-admin,keycloak-db} are in place (values not shown)"
