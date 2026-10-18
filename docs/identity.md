@@ -24,7 +24,7 @@ Keycloak must know its admin URL, and the tailnet name is kept out of this publi
 ```bash
 P=project-324502ff-9928-4b17-a89
 gcloud secrets create tailnet-domain --replication-policy=automatic --project="$P"
-read -rp "tailnet domain (for example tail1234.ts.net): " v
+printf 'tailnet domain (for example tail1234.ts.net): '; read -r v
 printf '%s' "$v" | gcloud secrets versions add tailnet-domain --data-file=- --project="$P"
 ```
 
