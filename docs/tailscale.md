@@ -24,13 +24,13 @@ bootstrap secret that cannot come from Git, so `make up` copies them from Google
    **Devices Core: write** and **Auth Keys: write**, and tag **`tag:k8s-operator`**. The client secret
    is shown once.
 4. **Store both values in Secret Manager** in project `project-324502ff-9928-4b17-a89`. Paste them
-   at a silent prompt so they never reach shell history or the process list:
+   at a silent prompt (these commands work in bash and zsh) so they never reach shell history or the process list:
 
    ```bash
    P=project-324502ff-9928-4b17-a89
    for s in tailscale-oauth-client-id tailscale-oauth-client-secret; do
      gcloud secrets create "$s" --replication-policy=automatic --project="$P"
-     read -rs -p "$s: " v; echo
+     printf '%s: ' "$s"; stty -echo; IFS= read -r v; stty echo; echo
      printf '%s' "$v" | gcloud secrets versions add "$s" --data-file=- --project="$P"
      unset v
    done
@@ -68,7 +68,7 @@ Istio ambient mesh.
 ## Rotation
 
 1. Create a new OAuth client with the same scopes and tag (or generate a new secret on the existing one).
-2. Add a new version to each changed secret (same `read -rs` / `versions add` commands as above).
+2. Add a new version to each changed secret (same silent-prompt / `versions add` commands as above).
 3. If the cluster is up: `./scripts/bootstrap-secrets.sh`, then restart the operator so it reads the new
    files: `kubectl -n tailscale rollout restart deployment/operator`. Otherwise the next `make up` picks
    the new version up.

@@ -7,6 +7,7 @@
 # Steps: (1) cluster access; (2) every Argo CD Application is Synced and Healthy;
 #        (3) the Tailscale operator is available; (4) cert-manager is available;
 #        (5) echo app: wildcard Certificate Ready, DNS -> reserved IP, HTTPS 200 (once the app exists).
+#        (6) identity: Keycloak public issuer answers, admin console and master realm are not routed.
 # Bash 3.2 compatible (macOS): no associative arrays, no grep -P.
 set -euo pipefail
 
@@ -16,7 +17,7 @@ CLUSTER="${CLUSTER:-idp}"
 DOMAIN="${DOMAIN:-ithaca-idp.com}"
 TIMEOUT="${VERIFY_TIMEOUT:-900}" # seconds to wait for the sync waves to settle
 INTERVAL=10
-TOTAL_STEPS=5
+TOTAL_STEPS=6
 
 START=$SECONDS
 RESULTS=""
@@ -148,4 +149,37 @@ if kubectl get applications.argoproj.io echo -n argocd >/dev/null 2>&1; then
   pass "https://${HOST} returned 200${note}"
 else
   skip "echo app not deployed yet (wave 7)"
+fi
+
+# --- 6. identity (waves 8-9) -------------------------------------------------
+step 6 "identity (Keycloak public issuer, admin not exposed)"
+if kubectl get applications.argoproj.io keycloak -n argocd >/dev/null 2>&1; then
+  AUTH_HOST="auth.apps.${DOMAIN}"
+  info "waiting up to 600s for statefulset/keycloak in identity"
+  kubectl -n identity rollout status statefulset/keycloak --timeout=600s >/dev/null \
+    || fail "statefulset keycloak in identity is not ready (Secrets identity/* missing? run ./scripts/bootstrap-secrets.sh)"
+  pass "Keycloak is ready"
+
+  id_curl=(-s --max-time 20)
+  case "$(kubectl -n istio-ingress get certificate wildcard-apps -o jsonpath='{.spec.issuerRef.name}' 2>/dev/null)" in
+    *staging*) id_curl+=(-k) ;;
+  esac
+  disco="https://${AUTH_HOST}/realms/ithaca/.well-known/openid-configuration"
+  deadline=$((SECONDS + 300))
+  while :; do
+    body="$(curl "${id_curl[@]}" "$disco" || true)"
+    case "$body" in *"\"issuer\":\"https://${AUTH_HOST}/realms/ithaca\""*) break ;; esac
+    [ "$SECONDS" -ge "$deadline" ] && fail "$disco did not return the expected issuer after 300s"
+    info "issuer not answering yet, retrying"
+    sleep 10
+  done
+  pass "public issuer is https://${AUTH_HOST}/realms/ithaca"
+
+  for path in /admin/master/console/ /realms/master/.well-known/openid-configuration /metrics; do
+    code="$(curl "${id_curl[@]}" -o /dev/null -w '%{http_code}' "https://${AUTH_HOST}${path}" || true)"
+    [ "$code" = "404" ] || fail "https://${AUTH_HOST}${path} returned HTTP ${code:-none}, expected 404 (must not be exposed)"
+  done
+  pass "admin console, master realm and metrics are not exposed publicly (404)"
+else
+  skip "keycloak not deployed yet (wave 9)"
 fi
