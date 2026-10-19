@@ -11,6 +11,7 @@ Keycloak is the identity provider for the portal and later Grafana, Spinnaker an
 
 - The public ingress (`*.apps.ithaca-idp.com`, one load balancer) carries only what end users need: the portal and Keycloak's `ithaca` realm endpoints (`/realms/ithaca`, `/resources`) at `auth.apps.ithaca-idp.com`.
 - Public exposure is an **allow-list** (`HTTPRoute keycloak-public`). The admin console, `/admin`, the master realm and metrics have no route and return 404. `scripts/verify.sh` asserts this.
+- One exception: the admin console loads its 3rd-party-cookie check iframe from Keycloak's frontend URL (the public host), so exactly `/realms/master/protocol/openid-connect/3p-cookies/step1.html` and `step2.html` are routed. They are static pages with no API calls. The rest of the master realm stays unrouted.
 - The Keycloak admin console and the lldap UI are exposed only through Tailscale Ingresses (ADR 0005). Keycloak's public URL is fixed with `KC_HOSTNAME`; the admin URL comes from `KC_HOSTNAME_ADMIN`, built from a `tailnet-domain` Secret Manager secret so the tailnet name stays out of Git.
 - Cloud Armor in front of the public ingress remains an optional toggle for later.
 
