@@ -12,7 +12,7 @@
 - On the first run the script **generates** any missing secret (random 64-char hex) in Secret Manager. Values never appear on the terminal, in Terraform state or in Git. Later runs only read them, so the passwords survive `make down` / `make up`.
 - It needs `roles/secretmanager.admin` the first time (to create) and `roles/secretmanager.secretAccessor` after.
 - Read a value yourself when you need to log in: `gcloud secrets versions access latest --secret=keycloak-admin-password`.
-- To rotate, add a new version in Secret Manager and re-run the script; the pods read the Secret at start, so restart them (or run `make down` / `make up`).
+- **Rotation needs more than a new Secret Manager version.** The services only read these values when they first initialise their data: Postgres (`POSTGRES_PASSWORD`), Keycloak (`KC_BOOTSTRAP_ADMIN_PASSWORD` and the LDAP bind password stored in its database), and lldap (`LLDAP_LDAP_USER_PASS`). Adding a version and restarting pods does not revoke the old value, and leaves Keycloak unable to reach Postgres or LDAP. After a suspected leak, rebuild (`make down`, then `make up`), or change the password inside each running service first (`ALTER ROLE`, `kcadm.sh set-password`, the lldap UI) and then add the new Secret Manager version. Do not rotate `lldap-key-seed` on a cluster with users: every lldap password becomes invalid.
 - External Secrets replaces this script in a later phase (ADR 0005).
 
 ## Exposure and the optional `tailnet-domain` secret
