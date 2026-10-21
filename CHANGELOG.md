@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/ithaca-lab-org/idp-infra/compare/v1.0.0...v1.1.0) (2026-10-19)
+
+
+### Features
+
+* **secrets:** generate and inject identity secrets ([#15](https://github.com/ithaca-lab-org/idp-infra/issues/15)) ([f3f5721](https://github.com/ithaca-lab-org/idp-infra/commit/f3f572120e8fc906c35d6f8faae9cdd2d78c7e52))
+
 ## 1.0.0 (2026-10-14)
 
 
