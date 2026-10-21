@@ -3,7 +3,13 @@ resource "google_artifact_registry_repository" "this" {
   repository_id = var.repository_id
   location      = var.location
   format        = "DOCKER"
-  description   = "Container images for the IDP and its sample apps."
+
+  # A tag can be pushed once. Anyone able to push cannot silently replace an image that is
+  # already deployed under the same tag (images are tagged by git SHA).
+  docker_config {
+    immutable_tags = true
+  }
+  description = "Container images for the IDP and its sample apps."
 
   cleanup_policy_dry_run = false
 
