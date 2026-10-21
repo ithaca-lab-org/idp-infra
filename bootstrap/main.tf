@@ -83,6 +83,9 @@ resource "google_iam_workload_identity_pool_provider" "github" {
     "attribute.repository_owner" = "assertion.repository_owner"
     "attribute.ref"              = "assertion.ref"
     "attribute.repository_ref"   = "assertion.repository + '@' + assertion.ref"
+    # Numeric repository ID + the exact workflow file that runs the job (not just the ref), so
+    # another workflow in the same repo, or a repo renamed into the same name, cannot match.
+    "attribute.repo_id_workflow" = "assertion.repository_id + '@' + assertion.job_workflow_ref"
   }
 
   # Reject tokens from any other GitHub org. The numeric ID is immutable, so a
@@ -165,7 +168,8 @@ resource "google_service_account_iam_member" "apply_wif" {
 
 # --- Portal image push -------------------------------------------------------
 # A third identity with no project roles: it can only write to the one Artifact Registry
-# repository, and only workflows of the portal repo running on the push ref can use it.
+# repository, and only the image workflow of the portal repo (by numeric repository ID) running
+# on the push ref can use it. Other workflows in that repo, even on main, cannot.
 # Pull requests never get this identity (they build and scan without cloud access).
 
 resource "google_service_account" "portal_image_push" {
@@ -185,5 +189,5 @@ resource "google_artifact_registry_repository_iam_member" "portal_image_push" {
 resource "google_service_account_iam_member" "portal_image_push_wif" {
   service_account_id = google_service_account.portal_image_push.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "${local.wif_pool_root}/attribute.repository_ref/${local.portal_repo_full}@${var.image_push_ref}"
+  member             = "${local.wif_pool_root}/attribute.repo_id_workflow/${var.portal_repo_id}@${local.portal_repo_full}/${var.image_push_workflow}@${var.image_push_ref}"
 }
