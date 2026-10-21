@@ -17,3 +17,8 @@ output "apply_service_account" {
   description = "Service account for applies from the protected branch."
   value       = google_service_account.terraform_apply.email
 }
+
+output "portal_image_push_service_account" {
+  description = "Set as the GCP_PUSH_SA variable on the portal repository."
+  value       = google_service_account.portal_image_push.email
+}

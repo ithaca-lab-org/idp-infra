@@ -6,6 +6,7 @@ locals {
   state_bucket_name = "${var.project_id}-tfstate"
   wif_pool_root     = "principalSet://iam.googleapis.com/projects/${var.project_number}/locations/global/workloadIdentityPools/${google_iam_workload_identity_pool.github.workload_identity_pool_id}"
   infra_repo_full   = "${var.github_org}/${var.infra_repo}"
+  portal_repo_full  = "${var.github_org}/${var.portal_repo}"
 }
 
 # --- APIs -------------------------------------------------------------------
@@ -160,4 +161,29 @@ resource "google_service_account_iam_member" "apply_wif" {
   service_account_id = google_service_account.terraform_apply.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "${local.wif_pool_root}/attribute.repository_ref/${local.infra_repo_full}@${var.apply_ref}"
+}
+
+# --- Portal image push -------------------------------------------------------
+# A third identity with no project roles: it can only write to the one Artifact Registry
+# repository, and only workflows of the portal repo running on the push ref can use it.
+# Pull requests never get this identity (they build and scan without cloud access).
+
+resource "google_service_account" "portal_image_push" {
+  account_id   = "portal-image-push"
+  display_name = "Portal image push (GitHub Actions, ${var.image_push_ref})"
+  description  = "Pushes container images from ${local.portal_repo_full} on ${var.image_push_ref} only. No project roles."
+}
+
+resource "google_artifact_registry_repository_iam_member" "portal_image_push" {
+  project    = var.project_id
+  location   = var.region
+  repository = var.registry_repository_id
+  role       = "roles/artifactregistry.writer"
+  member     = google_service_account.portal_image_push.member
+}
+
+resource "google_service_account_iam_member" "portal_image_push_wif" {
+  service_account_id = google_service_account.portal_image_push.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "${local.wif_pool_root}/attribute.repository_ref/${local.portal_repo_full}@${var.image_push_ref}"
 }

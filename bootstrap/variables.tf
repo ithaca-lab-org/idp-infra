@@ -107,3 +107,21 @@ variable "billing_account_id" {
   type        = string
   default     = null
 }
+
+variable "portal_repo" {
+  description = "Repository (without org) that builds and pushes the portal container image."
+  type        = string
+  default     = "idp-portal"
+}
+
+variable "image_push_ref" {
+  description = "Only workflows running on this git ref may impersonate the image push service account."
+  type        = string
+  default     = "refs/heads/main"
+}
+
+variable "registry_repository_id" {
+  description = "Artifact Registry repository (created in envs/persistent) the image push account may write to."
+  type        = string
+  default     = "idp"
+}
