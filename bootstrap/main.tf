@@ -6,6 +6,7 @@ locals {
   state_bucket_name = "${var.project_id}-tfstate"
   wif_pool_root     = "principalSet://iam.googleapis.com/projects/${var.project_number}/locations/global/workloadIdentityPools/${google_iam_workload_identity_pool.github.workload_identity_pool_id}"
   infra_repo_full   = "${var.github_org}/${var.infra_repo}"
+  portal_repo_full  = "${var.github_org}/${var.portal_repo}"
 }
 
 # --- APIs -------------------------------------------------------------------
@@ -82,6 +83,9 @@ resource "google_iam_workload_identity_pool_provider" "github" {
     "attribute.repository_owner" = "assertion.repository_owner"
     "attribute.ref"              = "assertion.ref"
     "attribute.repository_ref"   = "assertion.repository + '@' + assertion.ref"
+    # Numeric repository ID + the exact workflow file that runs the job (not just the ref), so
+    # another workflow in the same repo, or a repo renamed into the same name, cannot match.
+    "attribute.repo_id_workflow" = "assertion.repository_id + '@' + assertion.job_workflow_ref"
   }
 
   # Reject tokens from any other GitHub org. The numeric ID is immutable, so a
@@ -160,4 +164,30 @@ resource "google_service_account_iam_member" "apply_wif" {
   service_account_id = google_service_account.terraform_apply.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "${local.wif_pool_root}/attribute.repository_ref/${local.infra_repo_full}@${var.apply_ref}"
+}
+
+# --- Portal image push -------------------------------------------------------
+# A third identity with no project roles: it can only write to the one Artifact Registry
+# repository, and only the image workflow of the portal repo (by numeric repository ID) running
+# on the push ref can use it. Other workflows in that repo, even on main, cannot.
+# Pull requests never get this identity (they build and scan without cloud access).
+
+resource "google_service_account" "portal_image_push" {
+  account_id   = "portal-image-push"
+  display_name = "Portal image push (GitHub Actions, ${var.image_push_ref})"
+  description  = "Pushes container images from ${local.portal_repo_full} on ${var.image_push_ref} only. No project roles."
+}
+
+resource "google_artifact_registry_repository_iam_member" "portal_image_push" {
+  project    = var.project_id
+  location   = var.region
+  repository = var.registry_repository_id
+  role       = "roles/artifactregistry.writer"
+  member     = google_service_account.portal_image_push.member
+}
+
+resource "google_service_account_iam_member" "portal_image_push_wif" {
+  service_account_id = google_service_account.portal_image_push.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "${local.wif_pool_root}/attribute.repo_id_workflow/${var.portal_repo_id}@${local.portal_repo_full}/${var.image_push_workflow}@${var.image_push_ref}"
 }

@@ -90,7 +90,7 @@ ensure_secret() {
 }
 
 command -v openssl >/dev/null 2>&1 || die "openssl not found on PATH"
-for s in lldap-admin-password lldap-jwt-secret lldap-key-seed keycloak-admin-password keycloak-db-password; do
+for s in lldap-admin-password lldap-jwt-secret lldap-key-seed keycloak-admin-password keycloak-db-password portal-session-key; do
   ensure_secret "$s"
   read_secret "$s" "$tmp/$s"
 done
@@ -130,3 +130,14 @@ apply_secret keycloak-admin "password=$tmp/keycloak-admin-password" ${admin_url[
 apply_secret keycloak-db "password=$tmp/keycloak-db-password"
 
 echo "bootstrap-secrets ok: Secrets $ID_NAMESPACE/{lldap,keycloak-admin,keycloak-db} are in place (values not shown)"
+
+# --- idp-system namespace (portal) ---------------------------------------------
+# The portal decodes SESSION_KEY as base64; the 64-char hex value is valid base64 text and
+# decodes to 48 random bytes, so the same generator is reused.
+PORTAL_NAMESPACE="${PORTAL_NAMESPACE:-idp-system}"
+kubectl create namespace "$PORTAL_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+  || die "could not create namespace $PORTAL_NAMESPACE"
+kubectl -n "$PORTAL_NAMESPACE" create secret generic portal-session \
+  --from-file=session-key="$tmp/portal-session-key" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+  || die "could not create or update Secret $PORTAL_NAMESPACE/portal-session"
+echo "bootstrap-secrets ok: Secret $PORTAL_NAMESPACE/portal-session is in place (value not shown)"
