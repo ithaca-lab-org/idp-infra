@@ -79,7 +79,6 @@ variable "apply_roles" {
     "roles/iam.serviceAccountUser",
     "roles/pubsub.admin",
     "roles/resourcemanager.projectIamAdmin",
-    "roles/secretmanager.admin",
     "roles/serviceusage.serviceUsageConsumer",
   ]
 }
