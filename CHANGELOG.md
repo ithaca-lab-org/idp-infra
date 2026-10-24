@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.2.0](https://github.com/ithaca-lab-org/idp-infra/compare/v1.1.0...v1.2.0) (2026-10-24)
+
+
+### Features
+
+* **bootstrap:** portal image push identity and portal session secret ([#20](https://github.com/ithaca-lab-org/idp-infra/issues/20)) ([8af15a3](https://github.com/ithaca-lab-org/idp-infra/commit/8af15a31ebf5a621cadaa0b6ae64046ba4ccd959))
+* **registry:** make image tags immutable ([#21](https://github.com/ithaca-lab-org/idp-infra/issues/21)) ([ebb6a11](https://github.com/ithaca-lab-org/idp-infra/commit/ebb6a11edd2cf6a5ce4e317755d390d9757b5136))
+* **secrets:** MongoDB credentials for the portal order store ([#24](https://github.com/ithaca-lab-org/idp-infra/issues/24)) ([86b96f9](https://github.com/ithaca-lab-org/idp-infra/commit/86b96f9236118b13b57910e989756747084c9f92))
+
+
+### Bug Fixes
+
+* **secrets:** apply Opus review findings (CI role, rotation docs, tailnet read) ([#18](https://github.com/ithaca-lab-org/idp-infra/issues/18)) ([19be0d3](https://github.com/ithaca-lab-org/idp-infra/commit/19be0d3fee29f41602cfeb818e7e37c32f34843b))
+
 ## [1.1.0](https://github.com/ithaca-lab-org/idp-infra/compare/v1.0.0...v1.1.0) (2026-10-19)
 
 
