@@ -90,7 +90,7 @@ ensure_secret() {
 }
 
 command -v openssl >/dev/null 2>&1 || die "openssl not found on PATH"
-for s in lldap-admin-password lldap-jwt-secret lldap-key-seed keycloak-admin-password keycloak-db-password portal-session-key; do
+for s in lldap-admin-password lldap-jwt-secret lldap-key-seed keycloak-admin-password keycloak-db-password portal-session-key portal-mongo-root-password portal-mongo-password; do
   ensure_secret "$s"
   read_secret "$s" "$tmp/$s"
 done
@@ -141,3 +141,11 @@ kubectl -n "$PORTAL_NAMESPACE" create secret generic portal-session \
   --from-file=session-key="$tmp/portal-session-key" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
   || die "could not create or update Secret $PORTAL_NAMESPACE/portal-session"
 echo "bootstrap-secrets ok: Secret $PORTAL_NAMESPACE/portal-session is in place (value not shown)"
+
+# MongoDB for the portal's orders: the root password is only used to initialise the database and
+# to create the portal's own user (readWrite on the idp database only), whose password the API uses.
+kubectl -n "$PORTAL_NAMESPACE" create secret generic portal-mongo \
+  --from-file=root-password="$tmp/portal-mongo-root-password" \
+  --from-file=app-password="$tmp/portal-mongo-password" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+  || die "could not create or update Secret $PORTAL_NAMESPACE/portal-mongo"
+echo "bootstrap-secrets ok: Secret $PORTAL_NAMESPACE/portal-mongo is in place (values not shown)"

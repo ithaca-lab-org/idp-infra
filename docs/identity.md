@@ -9,6 +9,7 @@
 | `keycloak-admin-password` | `identity/keycloak-admin` key `password` | Keycloak bootstrap admin (user `admin`) |
 | `keycloak-db-password` | `identity/keycloak-db` key `password` | Keycloak Postgres and Keycloak DB login |
 | `portal-session-key` | `idp-system/portal-session` key `session-key` | Portal session cookie signing key |
+| `portal-mongo-root-password`, `portal-mongo-password` | `idp-system/portal-mongo` keys `root-password`, `app-password` | Portal MongoDB: root only initialises the database, the API uses the `portal` user |
 
 - On the first run the script **generates** any missing secret (random 64-char hex) in Secret Manager. Values never appear on the terminal, in Terraform state or in Git. Later runs only read them, so the passwords survive `make down` / `make up`.
 - It needs `roles/secretmanager.admin` the first time (to create) and `roles/secretmanager.secretAccessor` after.
