@@ -88,3 +88,15 @@ from the admin console (Machines) after `make down`, or the new one gets a numbe
 
 External Secrets Operator with a Secret Manager `ClusterSecretStore` (Workload Identity, no keys)
 replaces `bootstrap-secrets.sh` in a later phase (ADR 0005).
+
+## Stale devices (cleaned automatically)
+
+The operator registers a tailnet device for itself and one per proxy (`keycloak-admin`, `lldap-admin`). Destroying the cluster leaves them behind, offline, and the next cluster's proxies then get `-1`, `-2` suffixes, which breaks the Keycloak admin URL (`KC_HOSTNAME_ADMIN` is built from the unsuffixed name).
+
+`scripts/tailscale-cleanup.sh` deletes the devices tagged `tag:k8s` or `tag:k8s-operator` through the Tailscale API with the operator's own OAuth client. `make down` runs it after a successful destroy, and `make up` runs it before building, so a failed earlier `make down` cannot leave stale names behind.
+
+- Dry run first: `make tailscale-cleanup` lists the candidates and deletes nothing. `make tailscale-cleanup DELETE=1` deletes them.
+- Devices that are online are skipped (add `--include-online` to the script to override), so running it by hand against a live cluster is safe.
+- It refuses to delete more than 50 devices in one run.
+- The OAuth client needs the scope **Devices Core: write** (the same scope the operator needs). If a delete returns HTTP 403, check the scope, and that the client's tag `tag:k8s-operator` owns `tag:k8s` in the policy file (section 2 above).
+- Failure never fails `make down`: it prints a message, and you delete the entries in the admin console under Machines.

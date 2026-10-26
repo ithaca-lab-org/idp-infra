@@ -8,6 +8,7 @@
 | `lldap-jwt-secret`, `lldap-key-seed` | `identity/lldap` keys `jwt-secret`, `key-seed` | lldap token signing |
 | `keycloak-admin-password` | `identity/keycloak-admin` key `password` | Keycloak bootstrap admin (user `admin`) |
 | `keycloak-db-password` | `identity/keycloak-db` key `password` | Keycloak Postgres and Keycloak DB login |
+| `lldap-seed-users-password` | `identity/lldap-seed-users` key `password` | One shared password for the seeded dev users (see below) |
 | `portal-session-key` | `idp-system/portal-session` key `session-key` | Portal session cookie signing key |
 | `portal-mongo-root-password`, `portal-mongo-password` | `idp-system/portal-mongo` keys `root-password`, `app-password` | Portal MongoDB: root only initialises the database, the API uses the `portal` user |
 
@@ -31,3 +32,12 @@ printf '%s' "$v" | gcloud secrets versions add tailnet-domain --data-file=- --pr
 ```
 
 Without it the script prints a notice and the admin console is only reachable through `kubectl -n identity port-forward svc/keycloak-http 8080:80`.
+
+## Seeded dev users
+
+On every rebuild an Argo CD post-sync Job (`idp-gitops` `workloads/identity/lldap-seed.yaml`) creates three groups (`cloudspend-bu`, `supplychain-bu`, `marketing-northeast-bu`) and seven fixture users (`user01` to `user07`) in lldap, with their group memberships, using lldap's own bootstrap script. The definitions live in the ConfigMaps in that file; the **password is not in Git**: all seven users use the Secret Manager secret `lldap-seed-users-password`, generated at random on the first `make up`.
+
+- Read it: `gcloud secrets versions access latest --secret=lldap-seed-users-password`
+- Choose your own (at least 8 characters): `printf %s "<password>" | gcloud secrets versions add lldap-seed-users-password --data-file=-`, then run `./scripts/bootstrap-secrets.sh` or `make up`.
+- The Keycloak login is public on the internet while the cluster is up: pick a password you would not mind a stranger trying, and keep the cluster up only when you need it.
+- The Job only creates and updates its own users and groups; it never deletes users you create by hand.

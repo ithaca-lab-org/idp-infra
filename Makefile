@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 ENV   ?= envs/dev
 
-.PHONY: help fmt check plan up down verify
+.PHONY: help fmt check plan up down verify tailscale-cleanup
 
 help:
 	@grep -E '^[a-z]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*##/ -/'
@@ -26,13 +26,18 @@ plan: ## terraform plan for $(ENV) (envs/dev or envs/persistent)
 # envs/persistent (KMS, registry, DNS, budget) is applied by CI on merge to main.
 up: ## build the destroyable platform (human only)
 	./scripts/precheck.sh
+	@./scripts/tailscale-cleanup.sh --delete || echo "tailscale-cleanup failed: stale devices may remain (docs/tailscale.md)"
 	terraform -chdir=$(ENV) init -input=false
 	terraform -chdir=$(ENV) apply
 	./scripts/bootstrap-secrets.sh
 	./scripts/verify.sh
 
-down: ## tear down network + GKE; persistent stack stays (human only)
+down: ## tear down network + GKE and deregister the cluster's Tailscale devices (human only)
 	terraform -chdir=$(ENV) destroy
+	@./scripts/tailscale-cleanup.sh --delete || echo "tailscale-cleanup failed: delete the stale devices by hand (docs/tailscale.md)"
+
+tailscale-cleanup: ## list stale cluster devices in the tailnet (DELETE=1 removes them)
+	./scripts/tailscale-cleanup.sh $(if $(DELETE),--delete,)
 
 verify: ## post-build checks
 	./scripts/verify.sh
