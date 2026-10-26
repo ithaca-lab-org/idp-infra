@@ -90,7 +90,7 @@ ensure_secret() {
 }
 
 command -v openssl >/dev/null 2>&1 || die "openssl not found on PATH"
-for s in lldap-admin-password lldap-jwt-secret lldap-key-seed keycloak-admin-password keycloak-db-password portal-session-key portal-mongo-root-password portal-mongo-password; do
+for s in lldap-admin-password lldap-jwt-secret lldap-key-seed keycloak-admin-password keycloak-db-password portal-session-key portal-mongo-root-password portal-mongo-password lldap-seed-users-password; do
   ensure_secret "$s"
   read_secret "$s" "$tmp/$s"
 done
@@ -128,8 +128,11 @@ else
 fi
 apply_secret keycloak-admin "password=$tmp/keycloak-admin-password" ${admin_url[@]+"${admin_url[@]}"}
 apply_secret keycloak-db "password=$tmp/keycloak-db-password"
+# One shared password for the seeded dev users (idp-gitops workloads/identity/lldap-seed.yaml). Generated at
+# random; set your own with: printf %s "<password>" | gcloud secrets versions add lldap-seed-users-password --data-file=-
+apply_secret lldap-seed-users "password=$tmp/lldap-seed-users-password"
 
-echo "bootstrap-secrets ok: Secrets $ID_NAMESPACE/{lldap,keycloak-admin,keycloak-db} are in place (values not shown)"
+echo "bootstrap-secrets ok: Secrets $ID_NAMESPACE/{lldap,keycloak-admin,keycloak-db,lldap-seed-users} are in place (values not shown)"
 
 # --- idp-system namespace (portal) ---------------------------------------------
 # The portal decodes SESSION_KEY as base64; the 64-char hex value is valid base64 text and
