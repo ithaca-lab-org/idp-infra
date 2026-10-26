@@ -93,10 +93,11 @@ replaces `bootstrap-secrets.sh` in a later phase (ADR 0005).
 
 The operator registers a tailnet device for itself and one per proxy (`keycloak-admin`, `lldap-admin`). Destroying the cluster leaves them behind, offline, and the next cluster's proxies then get `-1`, `-2` suffixes, which breaks the Keycloak admin URL (`KC_HOSTNAME_ADMIN` is built from the unsuffixed name).
 
-`scripts/tailscale-cleanup.sh` deletes the devices tagged `tag:k8s` or `tag:k8s-operator` through the Tailscale API with the operator's own OAuth client. `make down` runs it after a successful destroy, and `make up` runs it before building, so a failed earlier `make down` cannot leave stale names behind.
+`scripts/tailscale-cleanup.sh` deletes the project's devices through the Tailscale API with the operator's own OAuth client. A device is only touched if it carries `tag:k8s` or `tag:k8s-operator` **and** its hostname matches `TS_CLEANUP_HOSTNAMES` (default: `ithaca-idp-operator`, `keycloak-admin`, `lldap-admin`, each with an optional `-N` suffix). Add a hostname to that pattern when you add a new Tailscale Ingress.
 
+- `make down` runs it with `--delete --include-online` after a successful destroy: the destroyed devices still look online for a few minutes, and the cluster is known to be gone.
+- `make up` runs it with `--delete --if-no-cluster` before building: it does nothing if the GKE cluster exists, so a re-run against a live cluster cannot remove its proxies; otherwise it clears whatever a failed earlier `make down` left. It still skips anything that looks online.
 - Dry run first: `make tailscale-cleanup` lists the candidates and deletes nothing. `make tailscale-cleanup DELETE=1` deletes them.
-- Devices that are online are skipped (add `--include-online` to the script to override), so running it by hand against a live cluster is safe.
-- It refuses to delete more than 50 devices in one run.
+- A device whose `lastSeen` cannot be parsed counts as online and is skipped. It refuses to delete more than 50 devices, or any device with an unexpected id format.
 - The OAuth client needs the scope **Devices Core: write** (the same scope the operator needs). If a delete returns HTTP 403, check the scope, and that the client's tag `tag:k8s-operator` owns `tag:k8s` in the policy file (section 2 above).
-- Failure never fails `make down`: it prints a message, and you delete the entries in the admin console under Machines.
+- Failure never fails `make down` or `make up`: it prints a message, and you delete the entries in the admin console under Machines.
