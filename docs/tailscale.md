@@ -91,7 +91,7 @@ replaces `bootstrap-secrets.sh` in a later phase (ADR 0005).
 
 ## Stale devices (cleaned automatically)
 
-The operator registers a tailnet device for itself and one per proxy (`keycloak-admin`, `lldap-admin`). Destroying the cluster leaves them behind, offline, and the next cluster's proxies then get `-1`, `-2` suffixes, which breaks the Keycloak admin URL (`KC_HOSTNAME_ADMIN` is built from the unsuffixed name).
+The operator registers a tailnet device for itself and one per proxy (`keycloak-admin`, `lldap-admin`, `argocd-admin`). Destroying the cluster leaves them behind, offline, and the next cluster's proxies then get `-1`, `-2` suffixes, which breaks the Keycloak admin URL (`KC_HOSTNAME_ADMIN` is built from the unsuffixed name).
 
 `scripts/tailscale-cleanup.sh` deletes the project's devices through the Tailscale API with the operator's own OAuth client. A device is only touched if it carries `tag:k8s` or `tag:k8s-operator` **and** its hostname matches `TS_CLEANUP_HOSTNAMES` (default: `ithaca-idp-operator`, `keycloak-admin`, `lldap-admin`, each with an optional `-N` suffix). Add a hostname to that pattern when you add a new Tailscale Ingress.
 
