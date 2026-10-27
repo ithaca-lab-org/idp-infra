@@ -31,10 +31,11 @@ No viewer role: the Go client (`cloud.google.com/go/pubsub/v2`) publishes and re
 
 ## Resend API key
 
-Terraform creates the secret `resend-api-key` with no version, so no value is ever in state. `make up` (`scripts/bootstrap-secrets.sh`) skips it while it has no version and copies it into `idp-system/notifier-resend` once it does. To add it:
+Terraform does not manage this secret (the CI apply identity cannot create secrets, and no value should reach state). You create it once, when you have a Resend key. `make up` (`scripts/bootstrap-secrets.sh`) skips it while it is missing or has no version and copies it into `idp-system/notifier-resend` once it does. To create it:
 
 ```bash
 P=project-324502ff-9928-4b17-a89
+gcloud secrets create resend-api-key --replication-policy=automatic --project="$P"
 printf 'Resend API key: '; read -rs v; echo
 printf '%s' "$v" | gcloud secrets versions add resend-api-key --data-file=- --project="$P"; unset v
 ```

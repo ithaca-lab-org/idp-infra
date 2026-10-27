@@ -121,20 +121,3 @@ resource "google_service_account_iam_member" "subscriber_wi" {
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${local.wi_pool}[${var.subscriber_ksa.namespace}/${var.subscriber_ksa.name}]"
 }
-
-# --- Resend API key ------------------------------------------------------------
-# The secret container only: no version, so no value ever reaches Terraform state. A human
-# adds the version (docs/order-events.md); scripts/bootstrap-secrets.sh copies it into the
-# cluster when it exists and skips it otherwise. No IAM here: the notifier never reads Secret
-# Manager itself (same pattern as the other bootstrap secrets, ADR 0005).
-resource "google_secret_manager_secret" "resend_api_key" {
-  secret_id = var.resend_secret_id
-  labels    = var.labels
-
-  replication {
-    auto {}
-  }
-
-  # Deleting the container would delete the human-added version with it.
-  deletion_protection = true
-}

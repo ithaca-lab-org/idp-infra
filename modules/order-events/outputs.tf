@@ -27,8 +27,3 @@ output "subscriber_service_account_email" {
   description = "GSA for the notifier KSA annotation (iam.gke.io/gcp-service-account)."
   value       = google_service_account.subscriber.email
 }
-
-output "resend_secret_id" {
-  description = "Secret Manager secret for the Resend API key (no version until a human adds one)."
-  value       = google_secret_manager_secret.resend_api_key.secret_id
-}

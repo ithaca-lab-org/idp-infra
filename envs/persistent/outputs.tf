@@ -47,8 +47,3 @@ output "notifier_sa" {
   description = "Google service account for the idp-system/notifier KSA annotation."
   value       = module.order_events.subscriber_service_account_email
 }
-
-output "resend_secret_id" {
-  description = "Secret Manager secret for the Resend API key (empty until a human adds a version)."
-  value       = module.order_events.resend_secret_id
-}

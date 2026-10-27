@@ -79,14 +79,8 @@ variable "subscriber_ksa" {
   default     = { namespace = "idp-system", name = "notifier" }
 }
 
-variable "resend_secret_id" {
-  description = "Secret Manager secret that holds the Resend API key (created without a version)."
-  type        = string
-  default     = "resend-api-key"
-}
-
 variable "labels" {
-  description = "Labels for the topics, subscriptions and secret."
+  description = "Labels for the topics and subscriptions."
   type        = map(string)
   default     = { app = "order-events", stack = "idp" }
 }
