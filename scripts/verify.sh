@@ -8,7 +8,7 @@
 #        (3) the Tailscale operator is available; (4) cert-manager is available;
 #        (5) echo app: wildcard Certificate Ready, DNS -> reserved IP, HTTPS 200 (once the app exists).
 #        (6) identity: Keycloak public issuer answers, admin console and master realm are not routed.
-#        (7) portal stack: lldap seed, MongoDB, portal, operator and an end-to-end order smoke test
+#        (7) portal stack: lldap seed, MongoDB, portal, operator, notifier and an end-to-end order smoke test
 #            (creates and deletes a throwaway TeamNamespace; skip it with VERIFY_SMOKE=0).
 # Bash 3.2 compatible (macOS): no associative arrays, no grep -P.
 set -euo pipefail
@@ -215,6 +215,39 @@ if kubectl get applications.argoproj.io portal -n argocd >/dev/null 2>&1; then
       || fail "deployment $d in idp-system is not Available (kubectl -n idp-system logs deploy/$d)"
   done
   pass "portal-api and idp-operator are Available"
+
+  # Order events: portal-api publishes, the notifier subscribes. Only present once idp-gitops
+  # deploys the notifier. The smoke order below bypasses the portal, so it sends no event; this
+  # checks that both sides started cleanly and reports whether email sending is on.
+  if kubectl -n idp-system get deployment notifier >/dev/null 2>&1; then
+    info "waiting up to 300s for deployment/notifier"
+    kubectl -n idp-system wait --for=condition=Available deployment/notifier --timeout=300s >/dev/null       || fail "deployment notifier in idp-system is not Available (kubectl -n idp-system logs deploy/notifier)"
+    nlog=""
+    deadline=$((SECONDS + 90))
+    while :; do
+      nlog="$(kubectl -n idp-system logs deploy/notifier 2>&1 || true)"
+      case "$nlog" in *"notifier started"*) break ;; esac
+      [ "$SECONDS" -ge "$deadline" ] && fail "notifier did not report 'notifier started' (kubectl -n idp-system logs deploy/notifier)"
+      info "notifier is not subscribed yet, retrying"
+      sleep 5
+    done
+    case "$nlog" in
+      *" ERROR "*) fail "notifier logged errors (a Pub/Sub or Workload Identity problem?): $(printf '%s\n' "$nlog" | grep ' ERROR ' | head -n 1)" ;;
+    esac
+    case "$nlog" in
+      *"email sending is OFF"*) mode="email sending is OFF (logs only)" ;;
+      *"email sending is ON"*) mode="email sending is ON" ;;
+      *) fail "notifier did not report its email mode" ;;
+    esac
+    plog="$(kubectl -n idp-system logs deploy/portal-api 2>&1 || true)"
+    case "$plog" in
+      *"publishing order events"*) ;;
+      *) fail "portal-api is not publishing order events (PUBSUB_TOPIC unset or the image predates idp-portal #16): kubectl -n idp-system logs deploy/portal-api" ;;
+    esac
+    pass "notifier is subscribed (${mode}); portal-api publishes order events"
+  else
+    skip "notifier not deployed yet"
+  fi
 
   kubectl wait --for=condition=Established crd/teamnamespaces.idp.ithaca-idp.com --timeout=60s >/dev/null \
     || fail "CRD teamnamespaces.idp.ithaca-idp.com is not established"
