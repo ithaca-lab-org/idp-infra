@@ -42,3 +42,13 @@ module "budget" {
   project_number     = var.project_number
   amount_usd         = var.budget_usd
 }
+
+# Order events pipeline (portal-api -> Pub/Sub -> notifier). Persistent: topics, subscriptions,
+# service accounts and their Workload Identity bindings do not depend on the cluster, queued
+# events survive `make down`, and idle cost is zero. See docs/order-events.md.
+module "order_events" {
+  source = "../../modules/order-events"
+
+  project_id     = var.project_id
+  project_number = var.project_number
+}
