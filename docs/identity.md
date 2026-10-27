@@ -38,6 +38,16 @@ Without it the script prints a notice and the admin console is only reachable th
 On every rebuild an Argo CD post-sync Job (`idp-gitops` `workloads/identity/lldap-seed.yaml`) creates three groups (`cloudspend-bu`, `supplychain-bu`, `marketing-northeast-bu`) and seven fixture users (`user01` to `user07`) in lldap, with their group memberships, using lldap's own bootstrap script. The definitions live in the ConfigMaps in that file; the **password is not in Git**: all seven users use the Secret Manager secret `lldap-seed-users-password`, generated at random on the first `make up`.
 
 - Read it: `gcloud secrets versions access latest --secret=lldap-seed-users-password`
-- Choose your own (at least 8 characters): `printf %s "<password>" | gcloud secrets versions add lldap-seed-users-password --data-file=-`, then run `./scripts/bootstrap-secrets.sh` or `make up`.
+- Choose your own (8 to 128 characters, one line) in one of three ways. All of them store it as the latest version of the Secret Manager secret, so later `make up` runs keep using it without the variable:
+  - **Per run, from an environment variable:** `LLDAP_SEED_USERS_PASSWORD='<password>' make up` (also works with `./scripts/bootstrap-secrets.sh` on a running cluster). Beware that this puts the password in your shell history. A way that does not:
+    ```bash
+    printf 'seed password: '; stty -echo; IFS= read -r LLDAP_SEED_USERS_PASSWORD; stty echo; echo
+    export LLDAP_SEED_USERS_PASSWORD
+    make up
+    ```
+  - **From a file:** `LLDAP_SEED_USERS_PASSWORD_FILE=/path/to/file make up` (the variable wins if both are set).
+  - **Directly in Secret Manager**, once: `printf %s '<password>' | gcloud secrets versions add lldap-seed-users-password --data-file=-` (create the secret first with `gcloud secrets create lldap-seed-users-password --replication-policy=automatic` if it does not exist yet).
+- With none of these, an existing secret is kept as it is, and a missing one is generated at random.
+- On a running cluster a changed password reaches lldap at the next `identity` sync (the seed Job runs then), or on the next rebuild.
 - The Keycloak login is public on the internet while the cluster is up: pick a password you would not mind a stranger trying, and keep the cluster up only when you need it.
 - The Job only creates and updates its own users and groups; it never deletes users you create by hand.
