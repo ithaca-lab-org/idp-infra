@@ -155,8 +155,8 @@ kubectl -n "$PORTAL_NAMESPACE" create secret generic portal-mongo \
   || die "could not create or update Secret $PORTAL_NAMESPACE/portal-mongo"
 echo "bootstrap-secrets ok: Secret $PORTAL_NAMESPACE/portal-mongo is in place (values not shown)"
 
-# Optional: the notifier's Resend API key. Terraform (modules/order-events) creates the empty
-# Secret Manager secret; a human adds the version (docs/order-events.md). Until then sending is
+# Optional: the notifier's Resend API key. A human creates the Secret Manager
+# secret and adds the version (docs/order-events.md); Terraform does not manage it. Until then sending is
 # off (NOTIFIER_SEND_EMAIL unset) and the notifier mounts the Secret with optional: true, so a
 # missing secret, or one without a version, is skipped here instead of failing `make up`.
 # Never generated: the value comes from Resend.
@@ -170,6 +170,8 @@ if gcloud secrets versions access latest --secret="$SM_RESEND" --project="$PROJE
 elif grep -q -E 'NOT_FOUND|FAILED_PRECONDITION' "$tmp/err"; then
   # NOT_FOUND: no secret or no version yet. FAILED_PRECONDITION: the latest version is disabled.
   echo "bootstrap-secrets: no enabled version of $SM_RESEND; skipping $PORTAL_NAMESPACE/notifier-resend (email sending stays off, docs/order-events.md)"
+  # a revoked or deleted key must not linger in the cluster
+  kubectl -n "$PORTAL_NAMESPACE" delete secret notifier-resend --ignore-not-found >/dev/null 2>&1 || true
 else
   die "cannot read secret '$SM_RESEND': $(head -n 1 "$tmp/err")"
 fi

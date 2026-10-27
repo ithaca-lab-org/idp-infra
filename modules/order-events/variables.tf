@@ -27,7 +27,7 @@ variable "ack_deadline_seconds" {
 }
 
 variable "message_retention_duration" {
-  description = "How long unacknowledged messages are kept on each subscription (bounded; max 7 days)."
+  description = "How long unacknowledged messages are kept on each subscription (bounded; Pub/Sub allows up to 31 days)."
   type        = string
   default     = "604800s"
 }

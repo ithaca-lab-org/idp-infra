@@ -59,8 +59,9 @@ resource "google_pubsub_subscription" "dead_letter" {
   topic  = google_pubsub_topic.dead_letter.id
   labels = var.labels
 
-  ack_deadline_seconds       = var.ack_deadline_seconds
-  message_retention_duration = var.message_retention_duration
+  ack_deadline_seconds = var.ack_deadline_seconds
+  # the longest Pub/Sub allows: nobody is watching this subscription, failures must not vanish in a week
+  message_retention_duration = "2678400s"
   retain_acked_messages      = false
 
   expiration_policy {
