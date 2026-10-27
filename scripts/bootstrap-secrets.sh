@@ -89,7 +89,44 @@ ensure_secret() {
   echo "bootstrap-secrets: generated $name in Secret Manager"
 }
 
+# provide_seed_password: optionally set the seeded dev users' password for this and later runs.
+# Give it as LLDAP_SEED_USERS_PASSWORD or as a file in LLDAP_SEED_USERS_PASSWORD_FILE (the variable
+# wins). It becomes the latest version of the Secret Manager secret, so later runs keep using it
+# without the variable. The value goes through a private file, never argv or stdout. Without either
+# variable nothing changes: an existing secret is kept, and a missing one is generated at random.
+provide_seed_password() {
+  local name="lldap-seed-users-password" pw="${LLDAP_SEED_USERS_PASSWORD:-}"
+  if [ -z "$pw" ] && [ -n "${LLDAP_SEED_USERS_PASSWORD_FILE:-}" ]; then
+    [ -r "$LLDAP_SEED_USERS_PASSWORD_FILE" ] || die "LLDAP_SEED_USERS_PASSWORD_FILE is not a readable file"
+    pw="$(cat "$LLDAP_SEED_USERS_PASSWORD_FILE")"
+  fi
+  [ -n "$pw" ] || return 0
+  if [ "${#pw}" -lt 8 ] || [ "${#pw}" -gt 128 ]; then
+    die "the seed users' password must be 8 to 128 characters (lldap's minimum is 8)"
+  fi
+  case "$pw" in
+    *$'\n'*|*$'\r'*) die "the seed users' password must be a single line" ;;
+  esac
+  printf '%s' "$pw" >"$tmp/seed-provided"
+  if gcloud secrets versions access latest --secret="$name" --project="$PROJECT" >"$tmp/seed-current" 2>"$tmp/err"; then
+    if cmp -s "$tmp/seed-current" "$tmp/seed-provided"; then
+      echo "bootstrap-secrets: $name already holds the provided password"
+      return 0
+    fi
+  else
+    grep -q 'NOT_FOUND' "$tmp/err" || die "cannot read secret '$name': $(head -n 1 "$tmp/err")"
+    if ! gcloud secrets describe "$name" --project="$PROJECT" >/dev/null 2>&1; then
+      gcloud secrets create "$name" --replication-policy=automatic --project="$PROJECT" >/dev/null 2>"$tmp/err" \
+        || die "could not create secret '$name': $(head -n 1 "$tmp/err")"
+    fi
+  fi
+  gcloud secrets versions add "$name" --data-file="$tmp/seed-provided" --project="$PROJECT" >/dev/null 2>"$tmp/err" \
+    || die "could not store the provided password in '$name': $(head -n 1 "$tmp/err")"
+  echo "bootstrap-secrets: stored the provided seed password as the latest version of $name (value not shown)"
+}
+
 command -v openssl >/dev/null 2>&1 || die "openssl not found on PATH"
+provide_seed_password
 for s in lldap-admin-password lldap-jwt-secret lldap-key-seed keycloak-admin-password keycloak-db-password portal-session-key portal-mongo-root-password portal-mongo-password lldap-seed-users-password; do
   ensure_secret "$s"
   read_secret "$s" "$tmp/$s"
