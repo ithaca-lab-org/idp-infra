@@ -8,6 +8,8 @@
 # rotation updates the Secret. Never prints secret values. See docs/tailscale.md.
 # Identity secrets (lldap, Keycloak admin, Keycloak DB) are generated into Secret Manager on
 # first run (random, never printed) and copied into the identity namespace. See docs/identity.md.
+# The optional Resend API key is copied to idp-system/notifier-resend when it has a version
+# (docs/order-events.md).
 # Replaced by External Secrets in a later phase (ADR 0005).
 set -euo pipefail
 set +x # never trace: the values below must not reach the terminal or CI logs
@@ -152,3 +154,24 @@ kubectl -n "$PORTAL_NAMESPACE" create secret generic portal-mongo \
   --from-file=app-password="$tmp/portal-mongo-password" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
   || die "could not create or update Secret $PORTAL_NAMESPACE/portal-mongo"
 echo "bootstrap-secrets ok: Secret $PORTAL_NAMESPACE/portal-mongo is in place (values not shown)"
+
+# Optional: the notifier's Resend API key. A human creates the Secret Manager
+# secret and adds the version (docs/order-events.md); Terraform does not manage it. Until then sending is
+# off (NOTIFIER_SEND_EMAIL unset) and the notifier mounts the Secret with optional: true, so a
+# missing secret, or one without a version, is skipped here instead of failing `make up`.
+# Never generated: the value comes from Resend.
+SM_RESEND="${RESEND_API_KEY_SECRET:-resend-api-key}"
+if gcloud secrets versions access latest --secret="$SM_RESEND" --project="$PROJECT" >"$tmp/resend-api-key" 2>"$tmp/err"; then
+  [ -s "$tmp/resend-api-key" ] || die "secret '$SM_RESEND' in project $PROJECT is empty"
+  kubectl -n "$PORTAL_NAMESPACE" create secret generic notifier-resend \
+    --from-file=api-key="$tmp/resend-api-key" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+    || die "could not create or update Secret $PORTAL_NAMESPACE/notifier-resend"
+  echo "bootstrap-secrets ok: Secret $PORTAL_NAMESPACE/notifier-resend is in place (value not shown)"
+elif grep -q -E 'NOT_FOUND|FAILED_PRECONDITION' "$tmp/err"; then
+  # NOT_FOUND: no secret or no version yet. FAILED_PRECONDITION: the latest version is disabled.
+  echo "bootstrap-secrets: no enabled version of $SM_RESEND; skipping $PORTAL_NAMESPACE/notifier-resend (email sending stays off, docs/order-events.md)"
+  # a revoked or deleted key must not linger in the cluster
+  kubectl -n "$PORTAL_NAMESPACE" delete secret notifier-resend --ignore-not-found >/dev/null 2>&1 || true
+else
+  die "cannot read secret '$SM_RESEND': $(head -n 1 "$tmp/err")"
+fi

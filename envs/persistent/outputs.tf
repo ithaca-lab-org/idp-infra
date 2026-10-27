@@ -22,3 +22,28 @@ output "cert_manager_dns01_sa" {
   description = "Google service account for cert-manager's DNS-01 solver."
   value       = module.cert_manager_dns.service_account_email
 }
+
+output "order_events_topic_id" {
+  description = "Order events topic (portal-api env PUBSUB_TOPIC)."
+  value       = module.order_events.topic_id
+}
+
+output "order_events_subscription_id" {
+  description = "Notifier subscription (notifier env PUBSUB_SUBSCRIPTION)."
+  value       = module.order_events.subscription_id
+}
+
+output "order_events_dead_letter_subscription_id" {
+  description = "Subscription for inspecting dead-lettered order events."
+  value       = module.order_events.dead_letter_subscription_id
+}
+
+output "portal_api_sa" {
+  description = "Google service account for the idp-system/portal-api KSA annotation."
+  value       = module.order_events.publisher_service_account_email
+}
+
+output "notifier_sa" {
+  description = "Google service account for the idp-system/notifier KSA annotation."
+  value       = module.order_events.subscriber_service_account_email
+}
