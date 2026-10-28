@@ -10,6 +10,8 @@
 #        (6) identity: Keycloak public issuer answers, admin console and master realm are not routed.
 #        (7) portal stack: lldap seed, MongoDB, portal, operator, notifier and an end-to-end order smoke test
 #            (creates and deletes a throwaway TeamNamespace; skip it with VERIFY_SMOKE=0).
+#        (8) vault: vault-0 Running and ready, Vault initialized and unsealed (Cloud KMS), and the
+#            VSO demo Secret vault-demo/hello has key message (value never printed). Needs jq.
 # Bash 3.2 compatible (macOS): no associative arrays, no grep -P.
 set -euo pipefail
 
@@ -19,7 +21,7 @@ CLUSTER="${CLUSTER:-idp}"
 DOMAIN="${DOMAIN:-ithaca-idp.com}"
 TIMEOUT="${VERIFY_TIMEOUT:-900}" # seconds to wait for the sync waves to settle
 INTERVAL=10
-TOTAL_STEPS=7
+TOTAL_STEPS=8
 
 START=$SECONDS
 RESULTS=""
@@ -302,4 +304,54 @@ EOF
   fi
 else
   skip "portal not deployed yet (wave 11)"
+fi
+
+# --- 8. vault ---------------------------------------------------------------
+step 8 "vault (initialized, unsealed by Cloud KMS, VSO demo secret)"
+if kubectl get applications.argoproj.io vault -n argocd >/dev/null 2>&1; then
+  command -v jq >/dev/null 2>&1 || fail "jq not found on PATH (needed to read vault status)"
+
+  # The chart's StatefulSet uses the OnDelete update strategy, so `rollout status` does not work:
+  # poll the ready count instead. vault-0 only turns Ready once Vault is initialized and unsealed.
+  info "waiting up to 600s for statefulset/vault in vault"
+  deadline=$((SECONDS + 600))
+  while :; do
+    ready="$(kubectl -n vault get statefulset vault -o jsonpath='{.status.readyReplicas}/{.spec.replicas}' 2>/dev/null || true)"
+    case "$ready" in
+      /* | "" | 0/*) ;;
+      *) [ "${ready%/*}" = "${ready#*/}" ] && break ;;
+    esac
+    [ "$SECONDS" -ge "$deadline" ] \
+      && fail "statefulset vault in vault is not ready (${ready:-not found}; not initialized? run ./scripts/bootstrap-secrets.sh; kubectl -n vault logs vault-0)"
+    info "statefulset vault ready ${ready:-?}, retrying"
+    sleep "$INTERVAL"
+  done
+  phase="$(kubectl -n vault get pod vault-0 -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  [ "$phase" = Running ] || fail "pod vault-0 is ${phase:-missing}, expected Running"
+  pass "statefulset vault is ready and vault-0 is Running"
+
+  # Exit code 0 = unsealed, 2 = sealed, 1 = error; the status output holds no secrets.
+  if vstatus="$(kubectl -n vault exec vault-0 -- vault status -format=json 2>/dev/null)"; then vrc=0; else vrc=$?; fi
+  vinit="$(printf '%s' "$vstatus" | jq -r '.initialized' 2>/dev/null || true)"
+  vsealed="$(printf '%s' "$vstatus" | jq -r '.sealed' 2>/dev/null || true)"
+  vtype="$(printf '%s' "$vstatus" | jq -r '.type' 2>/dev/null || true)"
+  [ "$vinit" = true ] || fail "Vault is not initialized (vault status exit $vrc): run ./scripts/bootstrap-secrets.sh"
+  [ "$vrc" = 0 ] && [ "$vsealed" = false ] \
+    || fail "Vault is initialized but sealed (vault status exit $vrc): KMS auto-unseal failing, see kubectl -n vault logs vault-0 and docs/vault.md"
+  pass "Vault is initialized and unsealed (seal type: ${vtype:-unknown})"
+
+  # Only checks that the key exists and is not empty: the template never outputs the value.
+  info "waiting up to 180s for Secret vault-demo/hello (synced by VSO from kv/vault-demo/hello)"
+  deadline=$((SECONDS + 180))
+  while :; do
+    has="$(kubectl -n vault-demo get secret hello -o go-template='{{with .data}}{{if .message}}yes{{end}}{{end}}' 2>/dev/null || true)"
+    [ "$has" = yes ] && break
+    [ "$SECONDS" -ge "$deadline" ] \
+      && fail "Secret vault-demo/hello with key message did not appear after 180s (kubectl -n vault-demo describe vaultstaticsecret; kubectl -n vault get jobs; docs/vault.md)"
+    info "Secret vault-demo/hello not synced yet, retrying"
+    sleep "$INTERVAL"
+  done
+  pass "VSO synced Secret vault-demo/hello (key message present, value not shown)"
+else
+  skip "vault not deployed yet"
 fi

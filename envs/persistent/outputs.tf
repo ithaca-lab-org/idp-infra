@@ -47,3 +47,28 @@ output "notifier_sa" {
   description = "Google service account for the idp-system/notifier KSA annotation."
   value       = module.order_events.subscriber_service_account_email
 }
+
+output "vault_kms_project" {
+  description = "Project of the Vault unseal key (gcpckms seal: project)."
+  value       = var.project_id
+}
+
+output "vault_kms_location" {
+  description = "Location of the Vault unseal key ring (gcpckms seal: region)."
+  value       = module.kms.location
+}
+
+output "vault_kms_key_ring" {
+  description = "Key ring of the Vault unseal key (gcpckms seal: key_ring)."
+  value       = module.kms.key_ring_name
+}
+
+output "vault_kms_crypto_key" {
+  description = "Vault unseal key name (gcpckms seal: crypto_key)."
+  value       = module.vault_unseal.key_name
+}
+
+output "vault_sa" {
+  description = "Google service account for the vault/vault KSA annotation."
+  value       = module.vault_unseal.service_account_email
+}
