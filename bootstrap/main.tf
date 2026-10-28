@@ -138,6 +138,17 @@ resource "google_billing_account_iam_member" "apply_costs_manager" {
   member             = google_service_account.terraform_apply.member
 }
 
+# The read-only plan identity refreshes the Terraform-owned budget on every PR plan. Without a
+# billing role it gets 403 on billingbudgets.budgets.get; the error was hidden until the plan step
+# used pipefail. Viewer is read-only (no budget changes).
+resource "google_billing_account_iam_member" "plan_billing_viewer" {
+  count = var.billing_account_id == null ? 0 : 1
+
+  billing_account_id = var.billing_account_id
+  role               = "roles/billing.viewer"
+  member             = google_service_account.terraform_plan.member
+}
+
 # State access is granted on the bucket only, not project-wide storage.
 # Plan needs object write too, because `terraform plan` takes a state lock.
 resource "google_storage_bucket_iam_member" "plan_state" {

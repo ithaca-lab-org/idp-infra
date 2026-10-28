@@ -81,6 +81,7 @@ jobs:
           TF_VAR_billing_account_id: ${{ vars.BILLING_ACCOUNT_ID }}
         run: |
           terraform init -input=false
+          set -o pipefail
           terraform plan -input=false -no-color -lock-timeout=60s | tee plan.txt
       - name: comment plan
         if: always()
