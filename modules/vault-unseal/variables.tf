@@ -17,7 +17,7 @@ variable "key_name" {
 variable "account_id" {
   description = "Account ID of the Google service account the Vault server runs as."
   type        = string
-  default     = "vault"
+  default     = "vault-server" # GCP requires 6 to 30 characters, so "vault" is rejected
 }
 
 variable "ksa" {
