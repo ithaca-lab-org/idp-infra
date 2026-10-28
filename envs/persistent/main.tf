@@ -52,3 +52,12 @@ module "order_events" {
   project_id     = var.project_id
   project_number = var.project_number
 }
+
+# Vault auto-unseal (seal "gcpckms"): key vault-unseal in the existing ring, GSA vault with
+# grants on that key only, Workload Identity for vault/vault. See docs/vault.md.
+module "vault_unseal" {
+  source = "../../modules/vault-unseal"
+
+  project_id  = var.project_id
+  key_ring_id = module.kms.key_ring_id
+}
