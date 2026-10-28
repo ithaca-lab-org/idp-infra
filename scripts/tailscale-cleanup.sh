@@ -2,7 +2,7 @@
 # Removes the Tailscale devices that cluster proxies leave behind in the tailnet.
 #
 # The Tailscale operator registers one device for itself and one per proxy (keycloak-admin,
-# lldap-admin, argocd-admin, ...). When the cluster is destroyed those devices stay in the tailnet, offline,
+# lldap-admin, argocd-admin, vault-admin, ...). When the cluster is destroyed those devices stay in the tailnet, offline,
 # and the next cluster's proxies get names with a -1, -2 suffix, which breaks KC_HOSTNAME_ADMIN.
 #
 # Usage: ./scripts/tailscale-cleanup.sh            dry run: lists what would be deleted
@@ -12,7 +12,7 @@
 #        --if-no-cluster      do nothing if the GKE cluster exists (`make up` uses this)
 #
 # Only devices that BOTH carry tag:k8s / tag:k8s-operator AND have one of this project's hostnames
-# (TS_CLEANUP_HOSTNAMES, default: the operator, keycloak-admin, lldap-admin, argocd-admin, each with an optional -N
+# (TS_CLEANUP_HOSTNAMES, default: the operator, keycloak-admin, lldap-admin, argocd-admin, vault-admin, each with an optional -N
 # suffix) are touched. Add a hostname there when a new Tailscale Ingress is added. Uses the operator's existing OAuth client from Secret Manager; needs the scope
 # "Devices Core: write" (docs/tailscale.md). Secret values never reach argv or stdout.
 # `make down` runs it with --delete after a successful destroy.
@@ -22,7 +22,7 @@ set +x # never trace: the values below must not reach the terminal or CI logs
 PROJECT="${PROJECT_ID:-project-324502ff-9928-4b17-a89}"
 ZONE="${ZONE:-us-central1-a}"
 CLUSTER="${CLUSTER:-idp}"
-HOSTNAME_RE="${TS_CLEANUP_HOSTNAMES:-^(ithaca-idp-operator|keycloak-admin|lldap-admin|argocd-admin)(-[0-9]+)?$}"
+HOSTNAME_RE="${TS_CLEANUP_HOSTNAMES:-^(ithaca-idp-operator|keycloak-admin|lldap-admin|argocd-admin|vault-admin)(-[0-9]+)?$}"
 SM_CLIENT_ID="${TS_OAUTH_CLIENT_ID_SECRET:-tailscale-oauth-client-id}"
 SM_CLIENT_SECRET="${TS_OAUTH_CLIENT_SECRET_SECRET:-tailscale-oauth-client-secret}"
 API="https://api.tailscale.com/api/v2"
