@@ -48,6 +48,7 @@ variable "enabled_apis" {
   default = [
     "artifactregistry.googleapis.com",
     "billingbudgets.googleapis.com",
+    "cloudbilling.googleapis.com",
     "cloudkms.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "compute.googleapis.com",
