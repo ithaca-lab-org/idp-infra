@@ -14,15 +14,15 @@ envs/persistent (CI)                  idp-gitops (Argo CD)                    ma
 ```
 
 - **Seal:** `seal "gcpckms"` with key `vault-unseal` in the existing `idp` key ring (same location as `gke-secrets`). Software protection, 90-day rotation (old versions keep decrypting), `prevent_destroy`. Vault unseals itself on every start; nobody types unseal keys. `vault operator init` therefore returns **recovery keys** (3 shares, threshold 2), not unseal keys.
-- **Identity:** the Vault pod runs as KSA `vault/vault`, which impersonates GSA `vault@<project>.iam.gserviceaccount.com` through Workload Identity. No JSON key.
+- **Identity:** the Vault pod runs as KSA `vault/vault`, which impersonates GSA `vault-server@<project>.iam.gserviceaccount.com` through Workload Identity. No JSON key.
 - **Storage:** integrated Raft on the pod's PVC. The PVC dies with the cluster (`make down`).
 - **Terraform** (`modules/vault-unseal`): the key, the GSA, and three grants, none at project or key-ring level:
 
 | Member | Role | On |
 |---|---|---|
-| GSA `vault` | `roles/cloudkms.cryptoKeyEncrypterDecrypter` | key `vault-unseal` only |
-| GSA `vault` | `roles/cloudkms.viewer` (the seal needs `cloudkms.cryptoKeys.get`) | key `vault-unseal` only |
-| KSA `vault/vault` (project pool `<project>.svc.id.goog`) | `roles/iam.workloadIdentityUser` | GSA `vault` only |
+| GSA `vault-server` | `roles/cloudkms.cryptoKeyEncrypterDecrypter` | key `vault-unseal` only |
+| GSA `vault-server` | `roles/cloudkms.viewer` (the seal needs `cloudkms.cryptoKeys.get`) | key `vault-unseal` only |
+| KSA `vault/vault` (project pool `<project>.svc.id.goog`) | `roles/iam.workloadIdentityUser` | GSA `vault-server` only |
 
 - **Outputs** of `envs/persistent` for the Helm values: `vault_kms_project`, `vault_kms_location`, `vault_kms_key_ring`, `vault_kms_crypto_key`, `vault_sa` (KSA annotation `iam.gke.io/gcp-service-account`).
 
