@@ -312,7 +312,8 @@ if kubectl get applications.argoproj.io vault -n argocd >/dev/null 2>&1; then
   command -v jq >/dev/null 2>&1 || fail "jq not found on PATH (needed to read vault status)"
 
   # The chart's StatefulSet uses the OnDelete update strategy, so `rollout status` does not work:
-  # poll the ready count instead. vault-0 only turns Ready once Vault is initialized and unsealed.
+  # poll the ready count instead. vault-0 is Ready even while sealed or uninitialized (the readiness
+  # probe accepts those states so the init can reach it); the vault status check below catches them.
   info "waiting up to 600s for statefulset/vault in vault"
   deadline=$((SECONDS + 600))
   while :; do

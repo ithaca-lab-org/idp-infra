@@ -12,7 +12,7 @@
 | `portal-session-key` | `idp-system/portal-session` key `session-key` | Portal session cookie signing key |
 | `portal-mongo-root-password`, `portal-mongo-password` | `idp-system/portal-mongo` keys `root-password`, `app-password` | Portal MongoDB: root only initialises the database, the API uses the `portal` user |
 | `resend-api-key` (optional, never generated) | `idp-system/notifier-resend` key `api-key` | Notifier email via Resend; skipped until a human creates it and adds a version, see `docs/order-events.md` |
-| `vault-root-token`, `vault-recovery-keys` (written by the script, never generated) | `vault/vault-bootstrap` key `root-token` | Output of `vault operator init`, stored as a new version on every rebuild; only when the `vault` app is deployed, see `docs/vault.md` |
+| `vault-recovery-keys` (written by the script, never generated) | none (the 30-minute bootstrap token in `vault/vault-bootstrap` key `token` is minted, not copied) | Vault recovery keys from `vault operator init`, a new version on every rebuild; only when the `vault` app is deployed. The root token is never stored. See `docs/vault.md` |
 
 - On the first run the script **generates** any missing secret (random 64-char hex) in Secret Manager. Values never appear on the terminal, in Terraform state or in Git. Later runs only read them, so the passwords survive `make down` / `make up`.
 - It needs `roles/secretmanager.admin` the first time (to create) and `roles/secretmanager.secretAccessor` after.

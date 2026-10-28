@@ -11,10 +11,10 @@
 # The optional Resend API key is copied to idp-system/notifier-resend when it has a version
 # (docs/order-events.md).
 # Vault (optional, only when idp-gitops deploys the `vault` Application): waits for vault-0 and,
-# if Vault is not initialized yet, runs `vault operator init` once, stores the root token and the
-# recovery keys as new versions of vault-root-token / vault-recovery-keys in Secret Manager and
-# creates Secret vault/vault-bootstrap (key root-token). Already initialized: nothing is touched.
-# See docs/vault.md.
+# if Vault is not initialized yet, runs `vault operator init` once, stores only the recovery keys
+# (new version of vault-recovery-keys in Secret Manager), swaps the root token for a 30-minute
+# bootstrap token in Secret vault/vault-bootstrap (key token) and revokes the root token. Already
+# initialized: never re-initialized, only checked. See docs/vault.md.
 # Replaced by External Secrets in a later phase (ADR 0005).
 set -euo pipefail
 set +x # never trace: the values below must not reach the terminal or CI logs
@@ -183,24 +183,57 @@ fi
 
 # --- vault (optional): one-time init per cluster -------------------------------------------
 # Vault's Raft disk dies with the cluster, so every `make up` brings up an empty, uninitialized
-# Vault: this section initializes it once (recovery keys, because the Cloud KMS seal unseals it
-# automatically; there are no unseal keys), stores the output as NEW versions of the Secret
-# Manager secrets below (older versions belong to a destroyed Vault and are useless), and hands the
-# root token to the idp-gitops config Job through Secret vault/vault-bootstrap. That Job revokes
-# the root token when it is done. An already initialized Vault is never touched.
-# The init output only ever exists in a 0600 file in this script's private temp dir and in pipes:
-# never in argv, never on stdout/stderr. See docs/vault.md.
+# Vault. This section initializes it once and then:
+#   1. stores ONLY the recovery keys (3 shares, threshold 2; the Cloud KMS seal unseals Vault by
+#      itself, so there are no unseal keys) as a NEW version of Secret Manager vault-recovery-keys
+#      (older versions belong to a destroyed Vault and are useless);
+#   2. uses the root token once, through `kubectl exec -i` STDIN only, to write policy
+#      vault-bootstrap, mint an orphan token with that policy (30 min, not renewable) and revoke
+#      the root token;
+#   3. hands the orphan token to the idp-gitops config Job as Secret vault/vault-bootstrap (key token).
+# The root token is never stored. Init output only lives in a 0600 file in this script's private
+# temp dir and in pipes: never in argv, env, stdout or stderr. An already initialized Vault is never
+# re-initialized, but it must have been initialized by this script (recovery keys newer than its
+# disk), otherwise someone else may hold its keys. See docs/vault.md.
 VAULT_NAMESPACE="vault"
 VAULT_POD="vault-0"
+VAULT_PVC="data-vault-0"
 VAULT_APP="vault"
 VAULT_K8S_SECRET="vault-bootstrap"
 ROOT_APP="${ROOT_APP:-argocd-root}"
-SM_VAULT_ROOT="vault-root-token"
 SM_VAULT_RECOVERY="vault-recovery-keys"
 VAULT_APP_TIMEOUT="${VAULT_APP_TIMEOUT:-900}"       # Argo CD creates child Applications wave by wave
 VAULT_POD_TIMEOUT="${VAULT_POD_TIMEOUT:-600}"       # vault-0 Running and its API answering
 VAULT_UNSEAL_TIMEOUT="${VAULT_UNSEAL_TIMEOUT:-120}" # KMS auto-unseal normally takes seconds
 VAULT_POLL="${VAULT_POLL:-10}"
+
+# What the config Job's bootstrap token may do. The ONLY copy of this list (docs/vault.md points here).
+VAULT_BOOTSTRAP_POLICY='path "sys/audit/*" { capabilities = ["create", "read", "update", "delete", "sudo"] }
+path "sys/audit" { capabilities = ["read", "list"] }
+path "sys/mounts" { capabilities = ["read", "list"] }
+path "sys/mounts/*" { capabilities = ["create", "read", "update", "delete", "sudo"] }
+path "sys/auth" { capabilities = ["read", "list"] }
+path "sys/auth/*" { capabilities = ["create", "read", "update", "delete", "sudo"] }
+path "sys/policies/acl/*" { capabilities = ["create", "read", "update", "delete", "list"] }
+path "auth/kubernetes/*" { capabilities = ["create", "read", "update", "delete", "list"] }
+path "kv/*" { capabilities = ["create", "read", "update", "delete", "list"] }
+path "auth/token/revoke-self" { capabilities = ["update"] }'
+
+# Runs inside vault-0 (`sh -c`; the script text holds no secret). STDIN: the root token on the
+# first line, then the policy. The CLI's token helper keeps the root token in $HOME/.vault-token for
+# these few commands only; the trap removes it. STDOUT: only the orphan token JSON.
+# Exit codes: 10 login, 11 policy write, 12 token create, 13 root revoke.
+VAULT_IN_POD='set -eu
+umask 077
+cleanup() { rm -f "$HOME/.vault-token"; }
+trap cleanup EXIT
+trap "exit 1" INT TERM HUP
+IFS= read -r t || exit 10
+printf "%s" "$t" | vault login -no-print - >/dev/null || exit 10
+t=""
+vault policy write vault-bootstrap - >/dev/null || exit 11
+vault token create -orphan -no-default-policy -policy=vault-bootstrap -ttl=30m -renewable=false -format=json || exit 12
+vault token revoke -self >/dev/null || exit 13'
 
 vault_app_exists() { kubectl -n argocd get applications.argoproj.io "$VAULT_APP" >/dev/null 2>&1; }
 
@@ -238,6 +271,8 @@ vault_status() {
 }
 
 vault_kms_hint="auto-unseal with Cloud KMS is failing. Check: kubectl -n $VAULT_NAMESPACE logs $VAULT_POD (look for gcpckms or PermissionDenied), the KSA $VAULT_NAMESPACE/vault annotation iam.gke.io/gcp-service-account, and the vault GSA's grants on KMS key vault-unseal (envs/persistent applied?). See docs/vault.md."
+vault_rebuild="Rebuild Vault: kubectl -n $VAULT_NAMESPACE delete pvc $VAULT_PVC --wait=false; kubectl -n $VAULT_NAMESPACE delete pod $VAULT_POD; then re-run ./scripts/bootstrap-secrets.sh (docs/vault.md, 'Rebuild Vault')."
+vault_genroot="The recovery keys are in Secret Manager $SM_VAULT_RECOVERY: get an admin token with 'vault operator generate-root' (docs/vault.md) and finish by hand, or: $vault_rebuild"
 
 wait_unsealed() {
   local deadline=$((SECONDS + VAULT_UNSEAL_TIMEOUT))
@@ -247,6 +282,32 @@ wait_unsealed() {
     [ "$SECONDS" -ge "$deadline" ] && return 1
     sleep "$VAULT_POLL"
   done
+}
+
+# RFC 3339 (optionally with fractional seconds, Z or +00:00) to epoch seconds; empty on error.
+to_epoch() {
+  jq -rn --arg t "$1" '$t | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601' 2>/dev/null || true
+}
+
+# Front-running guard: the latest recovery-keys version must be newer than Vault's disk (the PVC;
+# the pod if there is none: pods are recreated on Spot preemption, PVCs are not). If not, this
+# Vault was initialized by someone else, whose recovery keys and root token we do not have.
+vault_keys_fresh() {
+  local disk vtime d v
+  disk="$(kubectl -n "$VAULT_NAMESPACE" get pvc "$VAULT_PVC" -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || true)"
+  [ -n "$disk" ] || disk="$(kubectl -n "$VAULT_NAMESPACE" get pod "$VAULT_POD" -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || true)"
+  vtime="$(gcloud secrets versions describe latest --secret="$SM_VAULT_RECOVERY" --project="$PROJECT" \
+    --format='value(createTime)' 2>/dev/null || true)"
+  d="$(to_epoch "$disk")"
+  v="$(to_epoch "$vtime")"
+  [ -n "$d" ] && [ -n "$v" ] && [ "$v" -gt "$d" ]
+}
+
+# Same detection as the config Job: once configured, the kubernetes/ auth mount is listed by the
+# unauthenticated sys/internal/ui/mounts endpoint (the Job tunes it to listing-visibility=unauth).
+vault_configured() {
+  kubectl -n "$VAULT_NAMESPACE" exec "$VAULT_POD" -- vault read -format=json sys/internal/ui/mounts 2>/dev/null \
+    | grep -q '"kubernetes/"'
 }
 
 # Create a Secret Manager secret without a version if it does not exist yet. Done BEFORE the init,
@@ -262,8 +323,6 @@ ensure_secret_container() {
   echo "bootstrap-secrets: created secret $name in Secret Manager"
 }
 
-vault_lost="Vault IS initialized, but its root token and recovery keys were not stored and are lost. Wipe Vault and re-run this script (docs/vault.md, 'Init output lost')."
-
 vault_deployed=""
 if vault_app_exists; then
   vault_deployed=1
@@ -277,9 +336,10 @@ else
       vault_deployed=1
       break
     fi
+    # A skipped init leaves an uninitialized Vault for anyone to initialize: never skip silently.
     if [ "$SECONDS" -ge "$deadline" ]; then
-      [ "$planned" = yes ] && die "Argo CD has not created the $VAULT_APP Application after ${VAULT_APP_TIMEOUT}s (earlier sync waves not Healthy?). Re-run ./scripts/bootstrap-secrets.sh once it exists."
-      break
+      [ "$planned" = yes ] && die "Argo CD has not created the $VAULT_APP Application after ${VAULT_APP_TIMEOUT}s (earlier sync waves not Healthy?). Vault is NOT initialized: re-run ./scripts/bootstrap-secrets.sh once it exists."
+      die "Argo CD has not reconciled $ROOT_APP after ${VAULT_APP_TIMEOUT}s, so it is unknown whether Vault is deployed. Re-run ./scripts/bootstrap-secrets.sh once Argo CD is up."
     fi
     if [ "$planned" = yes ]; then
       echo "bootstrap-secrets: waiting for Argo CD to create the $VAULT_APP Application (earlier sync waves first)"
@@ -311,23 +371,36 @@ while :; do
 done
 
 if [ "$VAULT_INIT" = true ]; then
-  # Idempotent: never re-init and never overwrite the stored token, keys or the K8s Secret.
+  # Never re-initialize and never overwrite the stored keys or the K8s Secret.
   if [ "$VAULT_SEALED" = true ]; then
     echo "bootstrap-secrets: Vault is initialized but sealed; waiting up to ${VAULT_UNSEAL_TIMEOUT}s for KMS auto-unseal"
     wait_unsealed || die "Vault is initialized but still sealed after ${VAULT_UNSEAL_TIMEOUT}s: $vault_kms_hint"
   fi
-  echo "bootstrap-secrets ok: Vault is already initialized and unsealed; nothing to do"
+  vault_keys_fresh || die "Vault is ALREADY INITIALIZED, but the latest $SM_VAULT_RECOVERY version in Secret Manager is not newer than Vault's disk: it may have been initialized by someone else, who would hold its root token and recovery keys. Do not use this Vault. $vault_rebuild"
+  if vault_configured; then
+    echo "bootstrap-secrets ok: Vault is initialized, unsealed and configured; nothing to do"
+  elif kubectl -n "$VAULT_NAMESPACE" get secret "$VAULT_K8S_SECRET" >/dev/null 2>&1; then
+    echo "bootstrap-secrets ok: Vault is initialized and unsealed; the config Job has not finished yet (Secret $VAULT_NAMESPACE/$VAULT_K8S_SECRET is present)"
+  else
+    die "Vault is initialized but not configured, and Secret $VAULT_NAMESPACE/$VAULT_K8S_SECRET is gone (a run that failed after init, or the 30-minute bootstrap token was never used). The root token is not stored anywhere. $vault_genroot"
+  fi
   exit 0
 fi
 
-ensure_secret_container "$SM_VAULT_ROOT"
 ensure_secret_container "$SM_VAULT_RECOVERY"
 
 echo "bootstrap-secrets: initializing Vault (3 recovery shares, threshold 2; output not shown)"
-kubectl -n "$VAULT_NAMESPACE" exec "$VAULT_POD" -- \
-  vault operator init -format=json -recovery-shares=3 -recovery-threshold=2 >"$tmp/vault-init.json" 2>"$tmp/err" \
-  || die "vault operator init failed: $(head -n 1 "$tmp/err")"
+if ! kubectl -n "$VAULT_NAMESPACE" exec "$VAULT_POD" -- \
+  vault operator init -format=json -recovery-shares=3 -recovery-threshold=2 >"$tmp/vault-init.json" 2>"$tmp/err"; then
+  head -n 1 "$tmp/err" >"$tmp/init-err"
+  # The exec can fail after Vault initialized (connection dropped): then the output is lost.
+  vault_status
+  [ "$VAULT_INIT" = true ] \
+    && die "vault operator init reported an error ($(cat "$tmp/init-err")) but Vault IS initialized: its recovery keys and root token may be lost. $vault_rebuild"
+  die "vault operator init failed: $(cat "$tmp/init-err")"
+fi
 
+vault_lost="Vault IS initialized, but its recovery keys were not stored and are lost. $vault_rebuild"
 jq -j '.root_token // ""' "$tmp/vault-init.json" >"$tmp/vault-root-token" 2>/dev/null || die "could not parse the init output. $vault_lost"
 [ -s "$tmp/vault-root-token" ] || die "the init output has no root token. $vault_lost"
 jq '{recovery_keys_b64, recovery_keys_hex, recovery_keys_shares, recovery_keys_threshold}' \
@@ -336,17 +409,35 @@ jq -e '(.recovery_keys_b64 | length) == 3' "$tmp/vault-recovery-keys" >/dev/null
   || die "the init output does not hold 3 recovery keys (is the gcpckms seal configured?). $vault_lost"
 rm -f "$tmp/vault-init.json"
 
-gcloud secrets versions add "$SM_VAULT_ROOT" --data-file="$tmp/vault-root-token" --project="$PROJECT" >/dev/null 2>"$tmp/err" \
-  || die "could not add a version to secret '$SM_VAULT_ROOT': $(head -n 1 "$tmp/err"). $vault_lost"
 gcloud secrets versions add "$SM_VAULT_RECOVERY" --data-file="$tmp/vault-recovery-keys" --project="$PROJECT" >/dev/null 2>"$tmp/err" \
-  || die "could not add a version to secret '$SM_VAULT_RECOVERY': $(head -n 1 "$tmp/err"). The root token was stored; the recovery keys are lost. Wipe Vault and re-run (docs/vault.md, 'Init output lost')."
-echo "bootstrap-secrets: stored new versions of $SM_VAULT_ROOT and $SM_VAULT_RECOVERY in Secret Manager"
+  || die "could not add a version to secret '$SM_VAULT_RECOVERY': $(head -n 1 "$tmp/err"). $vault_lost"
+rm -f "$tmp/vault-recovery-keys"
+echo "bootstrap-secrets: stored a new version of $SM_VAULT_RECOVERY in Secret Manager"
 
-# The config Job in idp-gitops waits for this Secret, configures Vault, then revokes the token.
+wait_unsealed || die "Vault was initialized but is still sealed after ${VAULT_UNSEAL_TIMEOUT}s: $vault_kms_hint Once it unseals: $vault_genroot"
+
+# Root token in on STDIN only (first line), policy after it; the orphan token JSON comes back on STDOUT.
+{
+  cat "$tmp/vault-root-token"
+  printf '\n%s\n' "$VAULT_BOOTSTRAP_POLICY"
+} | kubectl -n "$VAULT_NAMESPACE" exec -i "$VAULT_POD" -- sh -c "$VAULT_IN_POD" >"$tmp/vault-orphan.json" 2>"$tmp/err" \
+  && rc=0 || rc=$?
+rm -f "$tmp/vault-root-token"
+case "$rc" in
+  0) ;;
+  10) die "could not log in with the root token: $(head -n 1 "$tmp/err"). $vault_genroot" ;;
+  11) die "could not write policy vault-bootstrap: $(head -n 1 "$tmp/err"). The root token is still valid but stored nowhere. $vault_genroot" ;;
+  12) die "could not create the bootstrap token: $(head -n 1 "$tmp/err"). The root token is still valid but stored nowhere. $vault_genroot" ;;
+  13) die "could not revoke the root token: $(head -n 1 "$tmp/err"). It is still valid but stored nowhere; to be safe: $vault_rebuild" ;;
+  *) die "the bootstrap step in $VAULT_POD failed (exit $rc): $(head -n 1 "$tmp/err"). The root token may still be valid but is stored nowhere. $vault_genroot" ;;
+esac
+jq -j '.auth.client_token // ""' "$tmp/vault-orphan.json" >"$tmp/vault-bootstrap-token" 2>/dev/null || true
+rm -f "$tmp/vault-orphan.json"
+[ -s "$tmp/vault-bootstrap-token" ] || die "no bootstrap token in the token create output (the root token was revoked). $vault_genroot"
+
+# `kubectl create`, not `apply`: apply would copy the token into the last-applied annotation.
+kubectl -n "$VAULT_NAMESPACE" delete secret "$VAULT_K8S_SECRET" --ignore-not-found >/dev/null 2>&1 || true
 kubectl -n "$VAULT_NAMESPACE" create secret generic "$VAULT_K8S_SECRET" \
-  --from-file=root-token="$tmp/vault-root-token" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
-  || die "could not create or update Secret $VAULT_NAMESPACE/$VAULT_K8S_SECRET (the token is in Secret Manager $SM_VAULT_ROOT)"
-echo "bootstrap-secrets ok: Secret $VAULT_NAMESPACE/$VAULT_K8S_SECRET is in place (value not shown)"
-
-wait_unsealed || die "Vault was initialized but is still sealed after ${VAULT_UNSEAL_TIMEOUT}s: $vault_kms_hint"
-echo "bootstrap-secrets ok: Vault is initialized and unsealed by Cloud KMS"
+  --from-file=token="$tmp/vault-bootstrap-token" >/dev/null 2>"$tmp/err" \
+  || die "could not create Secret $VAULT_NAMESPACE/$VAULT_K8S_SECRET: $(head -n 1 "$tmp/err"). $vault_genroot"
+echo "bootstrap-secrets ok: Vault initialized and unsealed by Cloud KMS; root token revoked; Secret $VAULT_NAMESPACE/$VAULT_K8S_SECRET holds a 30-minute bootstrap token for the config Job (value not shown)"
