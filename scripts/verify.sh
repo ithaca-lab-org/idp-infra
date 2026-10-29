@@ -9,7 +9,8 @@
 #        (5) echo app: wildcard Certificate Ready, DNS -> reserved IP, HTTPS 200 (once the app exists).
 #        (6) identity: Keycloak public issuer answers, admin console and master realm are not routed.
 #        (7) portal stack: lldap seed, MongoDB, portal, operator, notifier and an end-to-end order smoke test
-#            (creates and deletes a throwaway TeamNamespace; skip it with VERIFY_SMOKE=0).
+#            (creates and deletes a throwaway TeamNamespace; skip it with VERIFY_SMOKE=0). With
+#            VAULT_ENABLED on the operator it also checks the namespace got its Vault access objects.
 #        (8) vault: vault-0 Running and ready, Vault initialized and unsealed (Cloud KMS), and the
 #            VSO demo Secret vault-demo/hello has key message (value never printed). Needs jq.
 # Bash 3.2 compatible (macOS): no associative arrays, no grep -P.
@@ -296,6 +297,26 @@ EOF
     kubectl -n "$SMOKE_NAME" get resourcequota/idp-quota limitrange/idp-limits networkpolicy/idp-default-deny-ingress rolebinding/idp-namespace-admin >/dev/null \
       || fail "namespace ${SMOKE_NAME} is missing quota, limits, network policy or the owner binding"
     pass "order smoke test: namespace created with quota, limits, default-deny policy and owner binding"
+    # Per-namespace Vault access (idp-portal #19): only when the operator runs with VAULT_ENABLED=true.
+    # The operator first purges kv/<ns>/ in Vault, then creates the ServiceAccount and VaultAuth,
+    # so give it time. This proves the objects exist; the templated login itself is exercised by a
+    # VaultStaticSecret (see workloads/vault/README.md, "Per-namespace access").
+    if [ "$(kubectl -n idp-system get deployment idp-operator -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="VAULT_ENABLED")].value}' 2>/dev/null || true)" = "true" ]; then
+      info "waiting up to 120s for the operator to create vault-reader and its VaultAuth in ${SMOKE_NAME}"
+      vdeadline=$((SECONDS + ${VERIFY_VAULT_WAIT:-120}))
+      while :; do
+        if kubectl -n "$SMOKE_NAME" get serviceaccount/vault-reader vaultauth/vault-reader >/dev/null 2>&1; then
+          break
+        fi
+        [ "$SECONDS" -ge "$vdeadline" ] && fail "namespace ${SMOKE_NAME} has no vault-reader ServiceAccount and VaultAuth (kubectl get teamnamespace ${SMOKE_NAME} -o yaml for the VaultReady condition; kubectl -n idp-system logs deploy/idp-operator)"
+        sleep 5
+      done
+      vready="$(kubectl get "teamnamespace/${SMOKE_NAME}" -o jsonpath='{.status.conditions[?(@.type=="VaultReady")].status}' 2>/dev/null || true)"
+      [ "$vready" = "True" ] || fail "TeamNamespace ${SMOKE_NAME} condition VaultReady is '${vready:-missing}', expected True"
+      pass "order smoke test: namespace has the Vault access objects (vault-reader ServiceAccount and VaultAuth, VaultReady=True)"
+    else
+      skip "operator runs without VAULT_ENABLED: per-namespace Vault access not checked"
+    fi
     kubectl delete teamnamespace "$SMOKE_NAME" --wait=false >/dev/null || fail "could not delete the smoke-test TeamNamespace"
     kubectl wait --for=delete "namespace/${SMOKE_NAME}" --timeout=180s >/dev/null \
       || fail "namespace ${SMOKE_NAME} was not removed after its TeamNamespace was deleted"
