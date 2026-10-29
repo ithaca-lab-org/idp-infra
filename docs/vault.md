@@ -34,6 +34,7 @@ envs/persistent (CI)                  idp-gitops (Argo CD)                    ma
 | Root token | **Nowhere.** Used once by `bootstrap-secrets.sh` (through `kubectl exec` stdin), then revoked | Seconds |
 | Bootstrap token (policy `vault-bootstrap`, orphan, 30 min, not renewable) | Secret `vault/vault-bootstrap` key `token` | Until the config Job uses it and deletes the Secret, or 30 minutes |
 | Recovery keys (3, threshold 2) | Secret Manager `vault-recovery-keys` (JSON: `recovery_keys_b64`, `recovery_keys_hex`, shares, threshold) | As long as this Vault lives (until the next `make down`) |
+| Proof admin token (policy `vault-proof`, orphan, 15 min) | A 0600 temp file of `scripts/vault-proof.sh` while it runs | Revoked by the script's cleanup, at most 15 minutes |
 | App secrets | Vault KV (`kv/<ns>/...`), copied by VSO into namespace Secrets | Until the next `make down` (see follow-ups) |
 
 `vault-recovery-keys` is not in Terraform (CI's apply identity cannot write Secret Manager). `bootstrap-secrets.sh` creates it on first use (needs `roles/secretmanager.admin` the first time, then version add). No value reaches the terminal, argv, env, logs or Git: the init output lives only in a 0600 file in the script's private temp dir (deleted right after use). Inside `vault-0` the root token sits in the CLI token helper file `$HOME/.vault-token` for the few commands that need it and is removed by a trap.
@@ -70,6 +71,65 @@ kubectl -n vault exec -it vault-0 -- vault operator generate-root -decode=<encod
 ```
 
 Use the token for the task at hand, then revoke it (`vault token revoke -self`). Cancel an unfinished attempt with `vault operator generate-root -cancel`. Prefer a scoped admin policy over root for anything regular. To finish a failed bootstrap by hand, use that token to write the policy and create the bootstrap token as `VAULT_BOOTSTRAP_POLICY` / `VAULT_IN_POD` in the script do, then `kubectl -n vault create secret generic vault-bootstrap --from-file=token=<file>`; a rebuild is usually simpler.
+
+## Proving per-namespace isolation
+
+`verify.sh` only checks that a TeamNamespace gets its `vault-reader` ServiceAccount and VaultAuth. `scripts/vault-proof.sh` proves the rest on a running cluster: a namespace reads its own `kv/<ns>/` through VSO, cannot read another namespace's path, and deleting a TeamNamespace purges its KV data (design: idp-gitops `workloads/vault/README.md`, "Per-namespace access"). Human-run only, from a laptop with `gcloud`, `kubectl` (pointed at the cluster), `jq` and `sha256sum` or `shasum`; your gcloud user needs `secretmanager.secretAccessor` on `vault-recovery-keys`. It takes about 3 to 10 minutes.
+
+```sh
+./scripts/vault-proof.sh             # run the proof
+./scripts/vault-proof.sh --cleanup   # remove leftovers of an interrupted run
+```
+
+What it creates and touches (all removed again on exit, also on failure or Ctrl-C):
+
+- a `generate-root` attempt with the recovery keys (2 of 3). The root token is decoded on the laptop with shell builtins, sent on `kubectl exec -i` stdin to one exec in `vault-0` that writes policy `vault-proof` and creates an **orphan admin token** (15 min, not renewable, only `kv/vproof-a/` and `kv/vproof-b/` plus lookup/revoke-self), then revokes the root token. Policy `vault-proof` stays in Vault (it grants nothing without a token; the next run overwrites it).
+- TeamNamespaces `vproof-a` and `vproof-b` (label `idp.ithaca-idp.com/vault-proof=true`, owner `verify@example.com`), the namespaces and objects the operator creates for them, VaultStaticSecrets and the Secrets VSO writes in them, and `kv/vproof-a/hello`, `kv/vproof-b/hello` (random values).
+- It refuses to start if `vproof-a` or `vproof-b` already exists (only `--cleanup` removes ones carrying its label; anything else is never touched) or if a `generate-root` attempt is in progress.
+
+Secrets (recovery keys, OTP, root and admin token, test values) only live in 0600 files in a private temp dir and in pipes, never in argv, env or output; values are compared by sha256.
+
+Expected output (abridged):
+
+```
+==> 1. preflight ... PASS  preflight
+==> 2. short-lived admin token ... PASS  admin token: orphan, policy vault-proof, 15 min; root token revoked
+==> 3. TeamNamespaces vproof-a and vproof-b ... PASS  ... VaultReady=True, ServiceAccount and VaultAuth vault-reader
+==> 4. write kv/vproof-a/hello and kv/vproof-b/hello ... PASS
+==> 5. positive
+    PASS  P1 vproof-a reads its own secret: Secret vproof-a/hello key message matches kv/vproof-a/hello by sha256
+    PASS  P2 vproof-b reads its own secret: ...
+==> 6. negative
+    PASS  P3 vproof-a cannot read kv/vproof-b/hello: Secret vproof-a/hello-b absent after 60s (VSO Warning reason: <reason>, Vault answered 403)
+    PASS  P4 vproof-b cannot read kv/vproof-a/hello: ...
+==> 7. purge
+    PASS  P5 deleting vproof-a purged kv/vproof-a/ and left kv/vproof-b/hello intact
+    PASS  P6 deleting vproof-b purged kv/vproof-b/; kv/vproof-a/ and kv/vproof-b/ are both gone
+==> cleanup
+    revoked the admin token
+===== vault-proof.sh summary (took ...) =====
+RESULT: all proofs passed
+```
+
+Exit code 0 only if every line is PASS. What a FAIL means:
+
+| FAIL | Meaning |
+|---|---|
+| `setup: ... leftover of an earlier run` | An interrupted run left `vproof-*`: run `--cleanup`, then retry. |
+| `setup: ... not created by this script` | Someone else owns that name; the script will not touch it. |
+| `setup: ... generate-root attempt is already in progress` | Another admin, or a killed run. Cancel it (command printed) only if it is yours. |
+| `setup: submitting recovery key ...` / `could not decode` / `admin token step` | `vault-recovery-keys` `latest` does not belong to this Vault, or Vault refused. A root token that was generated but not revoked is revoked by the cleanup; if that fails too, the summary says so: rebuild Vault. |
+| `setup: TeamNamespace ... Ready` / `VaultReady` | Operator problem (`kubectl -n idp-system logs deploy/idp-operator`); often the initial purge cannot log in to Vault. |
+| `P1`/`P2` did not appear | VSO cannot log in with role `ns-reader` or read its own path: check the VaultStaticSecret events, the `ns-reader` policy/role (config Job), the VaultConnection. |
+| `P1`/`P2` holds a different value | VSO synced something other than what was written: stale Secret or wrong path. |
+| `P3`/`P4` ISOLATION BROKEN | **Security bug**: a namespace read another namespace's secret. Check the `ns-reader` policy template and the role's bound namespaces before anything else. |
+| `P3`/`P4` no Warning event | The Secret stayed absent but VSO said nothing: VSO may not have reconciled; not a proof either way. |
+| `P3`/`P4` inconclusive | The positive proof in the same namespace failed, so a missing Secret proves nothing. |
+| `P5`/`P6` not removed | The operator's purge finalizer is stuck (`VaultPurgePending`, `idp-operator-purge` login or policy). |
+| `P5`/`P6` `kv/<ns>/ is present` | The purge did not delete the data; `kv/vproof-b/ changed` means it deleted too much. |
+| `cleanup: ...` | Something is left behind; run `--cleanup`. The admin token always expires after 15 minutes. |
+
+What it cannot prove: that tenant admins cannot create a `vault-reader` ServiceAccount token elsewhere (RBAC, see the idp-gitops README), anything about Vault paths other than `kv/<ns>/`, and isolation under a different VSO or Vault version than the one running.
 
 ## Rebuild Vault
 
