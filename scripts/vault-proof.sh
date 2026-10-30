@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # Proves on a running cluster that per-namespace Vault access works end to end and is isolated
 # (idp-gitops workloads/vault/README.md, "Per-namespace access"; docs/vault.md, "Proving
-# per-namespace isolation"). Run by a human from a laptop with gcloud and kubectl pointed at the
-# cluster; it is not part of `make up` or CI.
+# per-namespace isolation"). Run by a human from a laptop with kubectl pointed at the cluster as a
+# cluster admin; it is not part of `make up` or CI.
 #
 # What it does (and undoes):
-#   1. preflight: tools, Vault initialized and unsealed, operator VAULT_ENABLED=true, VSO objects;
-#      refuses when TeamNamespaces/namespaces vproof-a or vproof-b already exist.
-#   2. a short-lived admin token: `vault operator generate-root` with the recovery keys from Secret
-#      Manager vault-recovery-keys; the root token is swapped at once for an orphan token with
-#      policy vault-proof (only kv/vproof-a/ and kv/vproof-b/; TTL covers the worst-case run) and
-#      revoked.
+#   1. preflight: tools, Vault initialized and unsealed, operator VAULT_ENABLED=true, VSO objects,
+#      ServiceAccount vault/vault-proof; refuses when TeamNamespaces/namespaces vproof-a or
+#      vproof-b already exist.
+#   2. a short-lived admin token: a 10-minute ServiceAccount token for vault/vault-proof (audience
+#      vault) logs in to Vault's Kubernetes auth role vault-proof (idp-gitops workloads/vault,
+#      "Proof role vault-proof": only kv/vproof-a/ and kv/vproof-b/ plus a read of role
+#      portal-secrets; TTL = max TTL = 1 h, no renew-self, bound to 127.0.0.1). No root token, no generate-root (Vault 2.0 requires a
+#      token for it), no recovery keys.
 #   3. creates the throwaway TeamNamespaces vproof-a and vproof-b (label
 #      idp.ithaca-idp.com/vault-proof=true) and waits for Ready, VaultReady and vault-reader.
 #   4. writes kv/vproof-a/hello and kv/vproof-b/hello (random values, never shown).
@@ -19,29 +21,28 @@
 #      reports that Vault denied it (403 / permission denied).
 #   7. P7: the portal's Vault role portal-secrets is write-only (skipped if the role does not exist).
 #   8. P5/P6: deleting a TeamNamespace purges its kv/<ns>/ and leaves the other one intact.
-#   A PASS/FAIL line per proof and a summary. Cleanup (TeamNamespaces, KV leftovers, policy
-#   vault-proof, the admin and portal tokens, an unfinished generate-root, the root token if it was
-#   not revoked, temp files) runs on every exit, also on failure or Ctrl-C.
+#   A PASS/FAIL line per proof and a summary. Cleanup (TeamNamespaces, KV leftovers, the admin and
+#   portal Vault tokens via revoke-self, temp files) runs on every exit, also on failure or Ctrl-C.
 #
 # Usage: ./scripts/vault-proof.sh            run the proof
 #        ./scripts/vault-proof.sh --cleanup  remove leftovers of an interrupted run
 #
-# Secrets (recovery keys, OTP, root, admin and portal tokens, the test values) only live in 0600
+# Secrets (ServiceAccount JWTs, admin and portal Vault tokens, the test values) only live in 0600
 # files in a private temp dir and in pipes: never in argv (so not in `ps`), env, stdout, stderr or
 # logs. They reach vault-0 on `kubectl exec -i` STDIN only. Values are compared by sha256, never
 # printed. Bash 3.2 compatible (macOS).
 set -euo pipefail
-set +x # never trace: tokens and keys pass through this script
+set +x # never trace: tokens pass through this script
 
-PROJECT="${PROJECT_ID:-project-324502ff-9928-4b17-a89}"
 VAULT_NS="vault"
 VAULT_POD="vault-0"
-SM_VAULT_RECOVERY="vault-recovery-keys"
 NS_A="vproof-a"
 NS_B="vproof-b"
 MARK_KEY="idp.ithaca-idp.com/vault-proof"
 MARK_JSONPATH='{.metadata.labels.idp\.ithaca-idp\.com/vault-proof}'
-PROOF_POLICY_NAME="vault-proof"
+PROOF_ROLE="vault-proof" # Vault Kubernetes auth role and policy (idp-gitops workloads/vault/config-job.yaml)
+PROOF_SA="vault-proof"   # ServiceAccount vault/vault-proof (idp-gitops workloads/vault/proof-serviceaccount.yaml)
+PROOF_TOKEN_MAX=3600     # the role's token_max_ttl: the admin token dies after 1 h, whatever happens
 PORTAL_ROLE="portal-secrets"
 PORTAL_SA_NS="idp-system"
 PORTAL_SA="portal-api"
@@ -52,56 +53,7 @@ DELETE_TIMEOUT="${PROOF_DELETE_TIMEOUT:-300}" # per TeamNamespace deletion incl.
 P7_METADATA="${PROOF_P7_METADATA:-denied}"    # denied: expect read/list on kv/metadata/<ns>/ denied for the portal; skip
 POLL="${PROOF_POLL:-5}"
 ME="./scripts/vault-proof.sh"
-
-# Admin token TTL: the worst case of every wait that can happen while it is needed (step 3: two
-# TeamNamespaces, steps 5 and 6, step 8: two deletions, and the same two deletions again in the
-# cleanup when step 8 timed out) plus 15 minutes for exec/kubectl overhead and P7; at least 45 min.
-# The cleanup revokes it as soon as it is done, so a long TTL only matters if the script is killed.
-ADMIN_TTL=$((2 * READY_TIMEOUT + SYNC_TIMEOUT + DENY_WAIT + 4 * DELETE_TIMEOUT + 900))
-[ "$ADMIN_TTL" -ge 2700 ] || ADMIN_TTL=2700
-
-# Policy of the admin token. Only the two proof namespaces, nothing else. In Vault ACL paths a `*`
-# is a prefix glob only at the END of a path (anywhere else it is a literal character), so
-# "kv/data/vproof-*/*" would match nothing: the namespaces are listed one by one instead. The
-# metadata rules cover LIST kv/metadata/<ns>/ and DELETE kv/metadata/<ns>/<key>. Reading role
-# portal-secrets tells P7 whether it exists; deleting its own policy lets the cleanup remove it.
-PROOF_POLICY='path "kv/data/vproof-a/*" { capabilities = ["create", "update", "read", "delete"] }
-path "kv/data/vproof-b/*" { capabilities = ["create", "update", "read", "delete"] }
-path "kv/metadata/vproof-a/*" { capabilities = ["read", "list", "delete"] }
-path "kv/metadata/vproof-b/*" { capabilities = ["read", "list", "delete"] }
-path "auth/kubernetes/role/portal-secrets" { capabilities = ["read"] }
-path "sys/policies/acl/vault-proof" { capabilities = ["delete"] }
-path "auth/token/lookup-self" { capabilities = ["read"] }
-path "auth/token/revoke-self" { capabilities = ["update"] }'
-
-# Runs inside vault-0 (`sh -c`; the script text holds no secret). Arg: the TTL. STDIN: the ROOT
-# token on the first line, then the policy. Refuses (14) if policy vault-proof exists with other
-# content (someone else's), writes it, creates the admin token and revokes the root token. Why: the
-# root token can do anything and must live for seconds only, so it never leaves this one exec after
-# it is decoded; the proof itself runs on a token that can touch only kv/vproof-a/ and kv/vproof-b/
-# and dies by itself even if this script is killed. It is an orphan so that revoking the root token
-# (its parent) does not revoke it too. It keeps the default policy so that it can still revoke
-# itself after the cleanup deleted policy vault-proof. The CLI's token helper file
-# $HOME/.vault-token holds the root token for these few commands; the trap removes it.
-# STDOUT: only the admin token JSON. Exit codes: 10 login, 11 policy write, 12 token create,
-# 13 root revoke, 14 foreign policy, 15 policy read error.
-VAULT_MINT_IN_POD='set -eu
-umask 077
-cleanup() { rm -f "$HOME/.vault-token"; }
-trap cleanup EXIT
-trap "exit 1" INT TERM HUP
-IFS= read -r t || exit 10
-printf "%s" "$t" | vault login -no-print - >/dev/null || exit 10
-t=""
-p="$(cat)"
-if cur="$(vault policy read vault-proof 2>&1)"; then
-  [ "$cur" = "$p" ] || exit 14
-else
-  case "$cur" in *"No policy named"*) ;; *) exit 15 ;; esac
-fi
-printf "%s\n" "$p" | vault policy write vault-proof - >/dev/null || exit 11
-vault token create -orphan -policy=vault-proof -ttl="$1" -explicit-max-ttl="$1" -renewable=false -format=json || exit 12
-vault token revoke -self >/dev/null || exit 13'
+REBUILD="the vault-config Job only configures a freshly initialized Vault, so a Vault from before role $PROOF_ROLE was added needs a rebuild (make down, make up)"
 
 # Runs inside vault-0. Args: <op> <path>. STDIN: a token on the first line, then (write only) the
 # JSON request body. Exit 10 = login failed (stderr says why); otherwise the vault CLI's exit code
@@ -133,9 +85,6 @@ RESULTS=""
 FAILED=0
 MODE="proof"
 tmp=""
-GENROOT_PENDING=""
-POLICY_OURS=""
-KEEP_ROOT=""
 CREATED_A=""
 CREATED_B=""
 HASH_A=""
@@ -273,40 +222,6 @@ delete_if_ours() {
   kubectl wait --for=delete "namespace/$1" --timeout="$(remaining "$deadline")s" >/dev/null 2>&1 || return 1
 }
 
-# decode_root_token <encoded-file> <otp-file> <out-file>: the encoded token is the raw (unpadded)
-# standard base64 of root-token XOR OTP (Vault's roottoken.DecodeToken). Decoded here with shell
-# builtins and pipes instead of `vault operator generate-root -decode=... -otp=...`, which would put
-# both values in argv inside the pod.
-decode_root_token() {
-  local enc otp pad="" raw n i o v oct ch out=""
-  local -a b
-  enc="$(<"$1")"
-  otp="$(<"$2")"
-  case $((${#enc} % 4)) in 0) ;; 2) pad="==" ;; 3) pad="=" ;; *) return 1 ;; esac
-  raw="$(printf '%s%s' "$enc" "$pad" | base64 --decode 2>/dev/null | od -An -v -tu1)" || return 1
-  set -f
-  # shellcheck disable=SC2206 # word splitting of od's numbers is intended
-  b=($raw)
-  set +f
-  raw=""
-  n=${#otp}
-  [ "$n" -gt 0 ] && [ "${#b[@]}" -eq "$n" ] || return 1
-  i=0
-  while [ "$i" -lt "$n" ]; do
-    printf -v o '%d' "'${otp:i:1}"
-    v=$((b[i] ^ o))
-    [ "$v" -ge 33 ] && [ "$v" -le 126 ] || return 1
-    printf -v oct '%03o' "$v"
-    printf -v ch "\\$oct"
-    out="$out$ch"
-    i=$((i + 1))
-  done
-  b=()
-  [[ "$out" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
-  printf '%s' "$out" >"$3"
-  out=""
-  otp=""
-}
 
 tns_yaml() {
   printf 'apiVersion: idp.ithaca-idp.com/v1alpha1\nkind: TeamNamespace\nmetadata:\n  name: %s\n  labels:\n    %s: "true"\nspec:\n  businessUnit: verify-bu\n  owner: verify@example.com\n  size: small\n  orderId: %s\n' \
@@ -345,49 +260,30 @@ summary() {
   fi
 }
 
-# Root token cleanup: revoke it; delete the file only after a confirmed revoke or when Vault says
-# the token is not valid (any more). Otherwise KEEP the 0600 file and tell the human what to do.
-cleanup_root() {
-  local rc
-  if [ -n "$POLICY_OURS" ]; then
-    vault_op "$tmp/root-token" delete "sys/policies/acl/$PROOF_POLICY_NAME" >/dev/null 2>&1 && POLICY_OURS=""
+# A second Ctrl-C during the cleanup: still revoke the Vault tokens (best effort, a few seconds)
+# and remove the temp dir, then leave the TeamNamespaces to `--cleanup`.
+cleanup_interrupted() {
+  trap '' INT TERM HUP
+  local f
+  for f in "$tmp/admin-token" "$tmp/portal-token"; do
+    [ -s "$f" ] && vault_op "$f" revoke-self - >/dev/null 2>&1
+  done
+  if [ -n "$tmp" ] && [ -d "$tmp" ]; then
+    rm -f "$tmp"/* 2>/dev/null
+    rmdir "$tmp" 2>/dev/null
   fi
-  vault_op "$tmp/root-token" revoke-self - >/dev/null 2>"$tmp/err" && rc=0 || rc=$?
-  if [ "$rc" = 0 ]; then
-    rm -f "$tmp/root-token"
-    info "revoked the generated root token"
-  elif [ "$rc" = 10 ] && denied_err; then
-    rm -f "$tmp/root-token"
-    info "the generated root token is not valid (already revoked)"
-  else
-    KEEP_ROOT=1
-    pfail "cleanup: could NOT revoke the generated ROOT token; it may still be valid"
-    printf '\n    !!!!! A VALID VAULT ROOT TOKEN MAY EXIST. It is kept (mode 0600) in:\n' >&2
-    printf '    !!!!!   %s\n' "$tmp/root-token" >&2
-    printf '    !!!!! Revoke it (token on stdin only), then delete the file and its directory:\n' >&2
-    printf "    kubectl -n %s exec -i %s -- sh -c 'IFS= read -r t; printf %%s \"\$t\" | vault login -no-print - >/dev/null && vault token revoke -self; rc=\$?; rm -f \"\$HOME/.vault-token\"; exit \$rc' < '%s' && rm -f '%s' && rmdir '%s'\n" \
-      "$VAULT_NS" "$VAULT_POD" "$tmp/root-token" "$tmp/root-token" "$tmp" >&2
-    printf '    !!!!! If that fails too, rebuild Vault (docs/vault.md, "Rebuild Vault").\n\n' >&2
-  fi
+  printf "cleanup interrupted (Vault tokens revoked if possible): run %s --cleanup\n" "$ME" >&2
+  exit 130
 }
 
 cleanup() {
   local rc=$? n k admin_ok=1
   set +e
   trap - EXIT
-  trap 'printf "cleanup interrupted: run %s --cleanup\n" "$ME" >&2; exit 130' INT TERM HUP
+  trap cleanup_interrupted INT TERM HUP
   [ "$rc" = 0 ] || FAILED=1
   if [ "$MODE" = proof ]; then
     step "cleanup"
-    if [ -n "$GENROOT_PENDING" ]; then
-      if vexec vault operator generate-root -cancel >/dev/null 2>&1; then
-        info "cancelled the unfinished generate-root attempt"
-      else
-        pfail "cleanup: could not cancel the generate-root attempt: kubectl -n $VAULT_NS exec $VAULT_POD -- vault operator generate-root -cancel"
-      fi
-    fi
-    # Only present when minting the admin token failed before the root token was revoked.
-    [ -s "$tmp/root-token" ] && cleanup_root
     if [ -s "$tmp/portal-token" ]; then
       vault_op "$tmp/portal-token" revoke-self - >/dev/null 2>&1 && info "revoked the portal-secrets test token"
       rm -f "$tmp/portal-token"
@@ -413,34 +309,27 @@ cleanup() {
           MANUAL_LEFT="$MANUAL_LEFT $k"
         fi
       done
-      if [ -n "$admin_ok" ] && vault_op "$tmp/admin-token" delete "sys/policies/acl/$PROOF_POLICY_NAME" >/dev/null 2>"$tmp/err"; then
-        POLICY_OURS=""
-        info "deleted policy $PROOF_POLICY_NAME"
-      fi
       if vault_op "$tmp/admin-token" revoke-self - >/dev/null 2>&1; then
-        info "revoked the admin token"
+        info "revoked the $PROOF_ROLE token"
+      elif [ -n "$admin_ok" ]; then
+        info "could not revoke the $PROOF_ROLE token; it dies at its TTL (at most 1 h) anyway"
       else
-        info "could not revoke the admin token (expired already?); it dies at its TTL anyway"
+        info "could not revoke the $PROOF_ROLE token (expired already?); it dies at its TTL anyway"
       fi
     else
       for k in $KV_LEFT; do MANUAL_LEFT="$MANUAL_LEFT $k"; done
     fi
-    if [ -n "$POLICY_OURS" ]; then
-      pfail "cleanup: policy $PROOF_POLICY_NAME is left in Vault (grants nothing without a token). With an admin token: vault policy delete $PROOF_POLICY_NAME"
-    fi
     if [ -n "${MANUAL_LEFT// /}" ]; then
       pfail "cleanup: KV keys written by this run could not be removed (admin token expired or refused)"
-      info "remove them with an admin token (docs/vault.md, 'Getting an admin token later'):"
-      for k in $MANUAL_LEFT; do info "  vault kv metadata delete -mount=kv $k"; done
-      info "(the operator also purges kv/$NS_A/ and kv/$NS_B/ whenever a TeamNamespace of that name is created or deleted)"
+      info "keys under kv/$NS_A/ and kv/$NS_B/: the operator purges them whenever a TeamNamespace of that"
+      info "name is created or deleted, so the next run of $ME removes them before it writes anything."
+      info "keys anywhere else can only be removed by rebuilding Vault (no admin token exists, docs/vault.md):"
+      for k in $MANUAL_LEFT; do info "  kv/$k"; done
     fi
   fi
   if [ -n "$tmp" ] && [ -d "$tmp" ]; then
-    for k in "$tmp"/*; do
-      [ -n "$KEEP_ROOT" ] && [ "$k" = "$tmp/root-token" ] && continue
-      rm -f "$k" 2>/dev/null
-    done
-    [ -n "$KEEP_ROOT" ] || rmdir "$tmp" 2>/dev/null
+    rm -f "$tmp"/* 2>/dev/null
+    rmdir "$tmp" 2>/dev/null
   fi
   summary
   [ "$FAILED" = 0 ] && exit 0
@@ -449,7 +338,7 @@ cleanup() {
 
 # --- tools and temp dir -------------------------------------------------------------------------
 tools="kubectl jq"
-[ "$MODE" = proof ] && tools="kubectl gcloud jq base64 od awk"
+[ "$MODE" = proof ] && tools="kubectl jq base64 od awk"
 for t in $tools; do
   command -v "$t" >/dev/null 2>&1 || { printf 'vault-proof: %s not found on PATH\n' "$t" >&2; exit 1; }
 done
@@ -478,14 +367,8 @@ if [ "$MODE" = cleanup ]; then
       *) pfail "$n: could not read its state ($(first_err))" ;;
     esac
   done
-  if gr="$(vexec vault operator generate-root -status -format=json 2>/dev/null)" \
-    && [ "$(printf '%s' "$gr" | jq -r '.started' 2>/dev/null)" = true ]; then
-    info "a generate-root attempt is in progress. If it is from an interrupted run of this script, cancel it:"
-    info "  kubectl -n $VAULT_NS exec $VAULT_POD -- vault operator generate-root -cancel"
-  fi
-  info "KV data under kv/vproof-*/ is purged by the operator when a TeamNamespace is deleted. Policy"
-  info "$PROOF_POLICY_NAME may be left in Vault (harmless; 'vault policy delete $PROOF_POLICY_NAME' with an"
-  info "admin token). A leftover admin token expires by itself (TTL ${ADMIN_TTL}s)."
+  info "KV data under kv/$NS_A/ and kv/$NS_B/ is purged by the operator when a TeamNamespace of that"
+  info "name is created or deleted. A leftover $PROOF_ROLE Vault token expires by itself (at most 1 h)."
   exit 0
 fi
 
@@ -498,10 +381,9 @@ info "kubectl context: $ctx"
 if vstatus="$(vexec vault status -format=json 2>"$tmp/err")"; then vrc=0; else vrc=$?; fi
 vinit="$(printf '%s' "$vstatus" | jq -r '.initialized' 2>/dev/null || true)"
 vsealed="$(printf '%s' "$vstatus" | jq -r '.sealed' 2>/dev/null || true)"
-vthreshold="$(printf '%s' "$vstatus" | jq -r '.t // empty' 2>/dev/null || true)"
 [ "$vinit" = true ] || die "Vault is not initialized or not reachable (vault status exit $vrc: $(first_err)); run ./scripts/bootstrap-secrets.sh"
 [ "$vrc" = 0 ] && [ "$vsealed" = false ] || die "Vault is sealed (vault status exit $vrc); see docs/vault.md, Troubleshooting"
-info "Vault is initialized and unsealed (recovery threshold ${vthreshold:-unknown})"
+info "Vault is initialized and unsealed"
 
 venabled="$(kubectl -n idp-system get deployment idp-operator -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="VAULT_ENABLED")].value}' 2>/dev/null || true)"
 [ "$venabled" = true ] || die "the idp-operator does not run with VAULT_ENABLED=true (got '${venabled:-unset}'): per-namespace Vault access is off"
@@ -510,6 +392,8 @@ kubectl get crd teamnamespaces.idp.ithaca-idp.com vaultstaticsecrets.secrets.has
 kubectl -n vault-secrets-operator get vaultconnection idp-vault >/dev/null 2>&1 \
   || die "VaultConnection vault-secrets-operator/idp-vault is missing (idp-gitops workloads/vault-secrets-operator)"
 info "operator has VAULT_ENABLED=true; CRDs and VaultConnection vault-secrets-operator/idp-vault are present"
+kubectl -n "$VAULT_NS" get serviceaccount "$PROOF_SA" >/dev/null 2>"$tmp/err" \
+  || die "ServiceAccount $VAULT_NS/$PROOF_SA is missing ($(first_err)); it comes with idp-gitops workloads/vault (sync the vault app). Then: $REBUILD"
 
 for n in "$NS_A" "$NS_B"; do
   st="$(tns_state "$n")"
@@ -520,71 +404,43 @@ for n in "$NS_A" "$NS_B"; do
     *) die "could not check whether $n exists: $(first_err)" ;;
   esac
 done
-gr_status="$(vexec vault operator generate-root -status -format=json 2>"$tmp/err")" \
-  || die "could not read the generate-root status: $(first_err)"
-[ "$(printf '%s' "$gr_status" | jq -r '.started' 2>/dev/null)" = false ] \
-  || die "a generate-root attempt is already in progress (someone else, or a killed run). If it is yours: kubectl -n $VAULT_NS exec $VAULT_POD -- vault operator generate-root -cancel"
-info "WARNING: this creates the throwaway TeamNamespaces $NS_A and $NS_B, Vault policy $PROOF_POLICY_NAME"
-info "and an admin token (TTL ${ADMIN_TTL}s), and removes all of them again at the end."
+# Worst case of every wait while the admin token is needed (step 3: two TeamNamespaces, steps 5
+# and 6, step 8: two deletions, the same two again in the cleanup) plus 15 min for overhead.
+worst=$((2 * READY_TIMEOUT + SYNC_TIMEOUT + DENY_WAIT + 4 * DELETE_TIMEOUT + 900))
+if [ "$worst" -gt "$PROOF_TOKEN_MAX" ]; then
+  info "WARNING: with these PROOF_* timeouts a slow run can take ${worst}s, longer than the ${PROOF_TOKEN_MAX}s"
+  info "the $PROOF_ROLE token lives; it then fails with a Vault 403 and lists what is left."
+fi
+info "WARNING: this creates the throwaway TeamNamespaces $NS_A and $NS_B and a Vault token of role"
+info "$PROOF_ROLE (at most 1 h), and removes all of them again at the end."
 ppass "preflight"
 
 # --- 2. short-lived admin token -----------------------------------------------------------------
-step "2. short-lived admin token (generate-root with the recovery keys; root revoked at once)"
-gcloud secrets versions access latest --secret="$SM_VAULT_RECOVERY" --project="$PROJECT" >"$tmp/recovery.json" 2>"$tmp/err" \
-  || die "could not read Secret Manager $SM_VAULT_RECOVERY in $PROJECT (needs roles/secretmanager.secretAccessor): $(first_err)"
-nkeys="$(jq '.recovery_keys_b64 | length' "$tmp/recovery.json" 2>/dev/null || echo 0)"
-
-# Pending from here: the cleanup cancels an attempt that does not complete.
-GENROOT_PENDING=1
-vexec vault operator generate-root -init -format=json >"$tmp/gr-init.json" 2>"$tmp/err" \
-  || die "vault operator generate-root -init failed: $(first_err)"
-nonce="$(jq -r '.nonce // ""' "$tmp/gr-init.json" 2>/dev/null || true)"
-required="$(jq -r '.required // 0' "$tmp/gr-init.json" 2>/dev/null || echo 0)"
-jq -j '.otp // ""' "$tmp/gr-init.json" >"$tmp/otp" 2>/dev/null || true
-rm -f "$tmp/gr-init.json"
-[[ "$nonce" =~ ^[A-Za-z0-9-]+$ ]] || die "generate-root -init returned no nonce"
-[ -s "$tmp/otp" ] || die "generate-root -init returned no OTP"
-[[ "$required" =~ ^[1-9][0-9]*$ ]] || die "generate-root -init returned no key threshold"
-[[ "$nkeys" =~ ^[0-9]+$ ]] && [ "$nkeys" -ge "$required" ] \
-  || die "$SM_VAULT_RECOVERY holds ${nkeys} recovery keys (JSON recovery_keys_b64), $required are needed"
-i=0
-while [ "$i" -lt "$required" ]; do
-  # The key goes from Secret Manager's JSON through a pipe to vault's STDIN ("-").
-  jq -j --argjson i "$i" '.recovery_keys_b64[$i]' "$tmp/recovery.json" \
-    | vexec_in vault operator generate-root -nonce="$nonce" -format=json - >"$tmp/gr-step.json" 2>"$tmp/err" \
-    || die "submitting recovery key $((i + 1)) of $required failed: $(first_err) (stale keys? only 'latest' of $SM_VAULT_RECOVERY matches this Vault)"
-  i=$((i + 1))
-done
-rm -f "$tmp/recovery.json"
-[ "$(jq -r '.complete' "$tmp/gr-step.json" 2>/dev/null)" = true ] || die "generate-root did not complete after $required keys"
-jq -j 'if (.encoded_token // "") != "" then .encoded_token else (.encoded_root_token // "") end' "$tmp/gr-step.json" >"$tmp/encoded" 2>/dev/null || true
-rm -f "$tmp/gr-step.json"
-GENROOT_PENDING=""
-decode_root_token "$tmp/encoded" "$tmp/otp" "$tmp/root-token" || { rm -f "$tmp/encoded" "$tmp/otp"; die "could not decode the generated root token (the attempt completed; the root token is valid but held by nobody: rebuild Vault to be safe)"; }
-rm -f "$tmp/encoded" "$tmp/otp"
-
-{
-  cat "$tmp/root-token"
-  printf '\n%s\n' "$PROOF_POLICY"
-} | vexec_in sh -c "$VAULT_MINT_IN_POD" sh "${ADMIN_TTL}s" >"$tmp/admin.json" 2>"$tmp/err" && rc=0 || rc=$?
-# Policy vault-proof was written by this run (so the cleanup may delete it) for 0, 12 and 13.
-case "$rc" in 0 | 12 | 13) POLICY_OURS=1 ;; esac
-# On failure $tmp/root-token stays: the cleanup revokes the root token with it (and keeps the file
-# if that cannot be confirmed).
-case "$rc" in
-  0) rm -f "$tmp/root-token" ;;
-  10) die "could not log in with the generated root token: $(first_err)" ;;
-  11) die "could not write policy $PROOF_POLICY_NAME: $(first_err)" ;;
-  12) die "could not create the admin token: $(first_err)" ;;
-  13) die "could not revoke the generated root token: $(first_err)" ;;
-  14) die "policy $PROOF_POLICY_NAME already exists in Vault with content this script did not write: refusing to overwrite it (inspect it with an admin token: vault policy read $PROOF_POLICY_NAME)" ;;
-  15) die "could not check whether policy $PROOF_POLICY_NAME exists" ;;
-  *) die "the admin token step in $VAULT_POD failed (exit $rc): $(first_err)" ;;
-esac
+step "2. short-lived admin token (Kubernetes auth role $PROOF_ROLE as ServiceAccount $VAULT_NS/$PROOF_SA)"
+# The JWT is only used for this one login, so it gets the shortest lifetime the API allows. It goes
+# from kubectl's STDOUT through a pipe to a 0600 file and from there on STDIN to `jwt=-`.
+if ! kubectl -n "$VAULT_NS" create token "$PROOF_SA" --audience vault --duration 10m 2>"$tmp/err" | tr -d '\n' >"$tmp/proof-jwt" \
+  || [ ! -s "$tmp/proof-jwt" ]; then
+  rm -f "$tmp/proof-jwt"
+  die "could not get a token for ServiceAccount $VAULT_NS/$PROOF_SA (audience vault; needs create on serviceaccounts/token in namespace $VAULT_NS): $(first_err)"
+fi
+vexec_in sh -c "$VAULT_K8S_LOGIN_IN_POD" sh "$PROOF_ROLE" <"$tmp/proof-jwt" >"$tmp/admin.json" 2>"$tmp/err" || true
+rm -f "$tmp/proof-jwt"
 jq -j '.auth.client_token // ""' "$tmp/admin.json" >"$tmp/admin-token" 2>/dev/null || true
+apol="$(jq -r '(.auth.token_policies // .auth.policies // []) | join(",")' "$tmp/admin.json" 2>/dev/null || true)"
+attl="$(jq -r '.auth.lease_duration // 0' "$tmp/admin.json" 2>/dev/null || echo 0)"
 rm -f "$tmp/admin.json"
-[ -s "$tmp/admin-token" ] || die "no admin token in the token create output (the root token was revoked)"
-ppass "admin token: orphan, policy $PROOF_POLICY_NAME, TTL ${ADMIN_TTL}s; root token revoked (values not shown)"
+if [ ! -s "$tmp/admin-token" ]; then
+  rm -f "$tmp/admin-token"
+  if grep -qi 'invalid role name' "$tmp/err" 2>/dev/null; then
+    die "Vault has no Kubernetes auth role $PROOF_ROLE: $REBUILD"
+  fi
+  die "could not log in to Vault with role $PROOF_ROLE as $VAULT_NS/$PROOF_SA: $(first_err)"
+fi
+# A role that grants more than policy vault-proof is not what this script was reviewed against.
+# The cleanup revokes the token.
+[ "$apol" = "$PROOF_ROLE" ] || die "role $PROOF_ROLE issued a token with policies '$apol', expected only '$PROOF_ROLE': refusing to continue (vault read auth/kubernetes/role/$PROOF_ROLE)"
+ppass "admin token: role and policy $PROOF_ROLE, TTL ${attl}s = max TTL, no renew-self (value not shown)"
 
 # --- 3. throwaway TeamNamespaces ----------------------------------------------------------------
 step "3. TeamNamespaces $NS_A and $NS_B (waiting up to ${READY_TIMEOUT}s each)"
