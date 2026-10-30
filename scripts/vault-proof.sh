@@ -11,7 +11,7 @@
 #   2. a short-lived admin token: a 10-minute ServiceAccount token for vault/vault-proof (audience
 #      vault) logs in to Vault's Kubernetes auth role vault-proof (idp-gitops workloads/vault,
 #      "Proof role vault-proof": only kv/vproof-a/ and kv/vproof-b/ plus a read of role
-#      portal-secrets; 1 h, not renewable). No root token, no generate-root (Vault 2.0 requires a
+#      portal-secrets; TTL = max TTL = 1 h, no renew-self, bound to 127.0.0.1). No root token, no generate-root (Vault 2.0 requires a
 #      token for it), no recovery keys.
 #   3. creates the throwaway TeamNamespaces vproof-a and vproof-b (label
 #      idp.ithaca-idp.com/vault-proof=true) and waits for Ready, VaultReady and vault-reader.
@@ -260,11 +260,27 @@ summary() {
   fi
 }
 
+# A second Ctrl-C during the cleanup: still revoke the Vault tokens (best effort, a few seconds)
+# and remove the temp dir, then leave the TeamNamespaces to `--cleanup`.
+cleanup_interrupted() {
+  trap '' INT TERM HUP
+  local f
+  for f in "$tmp/admin-token" "$tmp/portal-token"; do
+    [ -s "$f" ] && vault_op "$f" revoke-self - >/dev/null 2>&1
+  done
+  if [ -n "$tmp" ] && [ -d "$tmp" ]; then
+    rm -f "$tmp"/* 2>/dev/null
+    rmdir "$tmp" 2>/dev/null
+  fi
+  printf "cleanup interrupted (Vault tokens revoked if possible): run %s --cleanup\n" "$ME" >&2
+  exit 130
+}
+
 cleanup() {
   local rc=$? n k admin_ok=1
   set +e
   trap - EXIT
-  trap 'printf "cleanup interrupted: run %s --cleanup\n" "$ME" >&2; exit 130' INT TERM HUP
+  trap cleanup_interrupted INT TERM HUP
   [ "$rc" = 0 ] || FAILED=1
   if [ "$MODE" = proof ]; then
     step "cleanup"
@@ -424,7 +440,7 @@ fi
 # A role that grants more than policy vault-proof is not what this script was reviewed against.
 # The cleanup revokes the token.
 [ "$apol" = "$PROOF_ROLE" ] || die "role $PROOF_ROLE issued a token with policies '$apol', expected only '$PROOF_ROLE': refusing to continue (vault read auth/kubernetes/role/$PROOF_ROLE)"
-ppass "admin token: role and policy $PROOF_ROLE, TTL ${attl}s, not renewable (value not shown)"
+ppass "admin token: role and policy $PROOF_ROLE, TTL ${attl}s = max TTL, no renew-self (value not shown)"
 
 # --- 3. throwaway TeamNamespaces ----------------------------------------------------------------
 step "3. TeamNamespaces $NS_A and $NS_B (waiting up to ${READY_TIMEOUT}s each)"
