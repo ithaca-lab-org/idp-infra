@@ -33,8 +33,8 @@ envs/persistent (CI)                  idp-gitops (Argo CD)                    ma
 | KMS key `vault-unseal` | Cloud KMS (persistent stack) | Permanent; cannot be deleted, only its versions scheduled for destruction |
 | Root token | **Nowhere.** Used once by `bootstrap-secrets.sh` (through `kubectl exec` stdin), then revoked | Seconds |
 | Bootstrap token (policy `vault-bootstrap`, orphan, 30 min, not renewable) | Secret `vault/vault-bootstrap` key `token` | Until the config Job uses it and deletes the Secret, or 30 minutes |
-| Recovery keys (3, threshold 2) | Secret Manager `vault-recovery-keys` (JSON: `recovery_keys_b64`, `recovery_keys_hex`, shares, threshold) | As long as this Vault lives (until the next `make down`) |
-| Proof admin token (policy `vault-proof`, orphan, TTL = worst-case run, at least 45 min) | A 0600 temp file of `scripts/vault-proof.sh` while it runs | Revoked by the script's cleanup; at most its TTL if the script is killed |
+| Recovery keys (3, threshold 2) | Secret Manager `vault-recovery-keys` (JSON: `recovery_keys_b64`, `recovery_keys_hex`, shares, threshold) | As long as this Vault lives (until the next `make down`). With Vault 2.0 they no longer yield a root token on their own (see "Admin access after the bootstrap") |
+| Proof token (Kubernetes auth role and policy `vault-proof`, 1 h, not renewable) | A 0600 temp file of `scripts/vault-proof.sh` while it runs | Revoked by the script's cleanup (`revoke-self`); at most 1 h if the script is killed |
 | App secrets | Vault KV (`kv/<ns>/...`), copied by VSO into namespace Secrets | Until the next `make down` (see follow-ups) |
 
 `vault-recovery-keys` is not in Terraform (CI's apply identity cannot write Secret Manager). `bootstrap-secrets.sh` creates it on first use (needs `roles/secretmanager.admin` the first time, then version add). No value reaches the terminal, argv, env, logs or Git: the init output lives only in a 0600 file in the script's private temp dir (deleted right after use). Inside `vault-0` the root token sits in the CLI token helper file `$HOME/.vault-token` for the few commands that need it and is removed by a trap.
@@ -55,26 +55,20 @@ The bootstrap token's policy is defined once, in `VAULT_BOOTSTRAP_POLICY` in `sc
 
 **Rebuilds:** Vault's data dies with the cluster, so each `make up` initializes a brand-new Vault and adds a new version of `vault-recovery-keys`. Older versions belong to a destroyed Vault and are useless (disable them whenever convenient: `gcloud secrets versions disable <n> --secret=vault-recovery-keys`). Only `latest` matters. KV data written by hand is lost too: anything that must survive belongs in Git (config Job) or in the portal flow that writes it again.
 
-## Getting an admin token later
+## Admin access after the bootstrap
 
-No root token exists after the init. To get one, two of the three recovery keys are needed (`generate-root` with an auto-unseal Vault takes recovery keys):
+No root token exists after the init, and **there is currently no documented break-glass admin path**. Vault 2.0.x (we run 2.0.4; fix for CVE-2026-5807) requires an authenticated request for `sys/generate-root` and `sys/rekey`, so `vault operator generate-root` with the recovery keys fails with 403 once the bootstrap root token is revoked. The recovery keys in `vault-recovery-keys` are still stored, but they no longer produce a root token on their own.
 
-```sh
-kubectl -n vault exec -it vault-0 -- vault operator generate-root -init
-# note the Nonce and the OTP it prints
-gcloud secrets versions access latest --secret=vault-recovery-keys | jq -r '.recovery_keys_b64[0]' \
-  | kubectl -n vault exec -i vault-0 -- vault operator generate-root -nonce=<nonce> -
-gcloud secrets versions access latest --secret=vault-recovery-keys | jq -r '.recovery_keys_b64[1]' \
-  | kubectl -n vault exec -i vault-0 -- vault operator generate-root -nonce=<nonce> -
-# the second call prints "Encoded Token"
-kubectl -n vault exec -it vault-0 -- vault operator generate-root -decode=<encoded token> -otp=<otp>
-```
+What exists instead:
 
-Use the token for the task at hand, then revoke it (`vault token revoke -self`). Cancel an unfinished attempt with `vault operator generate-root -cancel`. Prefer a scoped admin policy over root for anything regular. To finish a failed bootstrap by hand, use that token to write the policy and create the bootstrap token as `VAULT_BOOTSTRAP_POLICY` / `VAULT_IN_POD` in the script do, then `kubectl -n vault create secret generic vault-bootstrap --from-file=token=<file>`; a rebuild is usually simpler.
+- **Configuration changes** go into the idp-gitops `vault-config` Job and reach Vault on a rebuild (`make down` / `make up`, or "Rebuild Vault" below). Vault holds no data that must survive a rebuild yet.
+- **The `vault-proof` Kubernetes auth role** (idp-gitops `workloads/vault/README.md`, "Proof role vault-proof"): a cluster admin can log in as ServiceAccount `vault/vault-proof` and gets a 1-hour token for `kv/vproof-a/*`, `kv/vproof-b/*` and a read of role `portal-secrets`, nothing else. It is for `scripts/vault-proof.sh`, not general administration.
+
+A real break-glass path (for example a dedicated admin role or an encrypted, access-logged admin credential) is an open design decision; until it exists, a broken Vault is rebuilt.
 
 ## Proving per-namespace isolation
 
-`verify.sh` only checks that a TeamNamespace gets its `vault-reader` ServiceAccount and VaultAuth. `scripts/vault-proof.sh` proves the rest on a running cluster: a namespace reads its own `kv/<ns>/` through VSO, cannot read another namespace's path (Vault answers 403), the portal's role `portal-secrets` is write-only, and deleting a TeamNamespace purges its KV data (design: idp-gitops `workloads/vault/README.md`, "Per-namespace access" and "Portal Secrets"). Human-run only, from a laptop with `gcloud`, `kubectl` (pointed at the cluster, allowed to create a token for `idp-system/portal-api`), `jq` and `sha256sum` or `shasum`; your gcloud user needs `secretmanager.secretAccessor` on `vault-recovery-keys`. It takes about 3 to 10 minutes.
+`verify.sh` only checks that a TeamNamespace gets its `vault-reader` ServiceAccount and VaultAuth. `scripts/vault-proof.sh` proves the rest on a running cluster: a namespace reads its own `kv/<ns>/` through VSO, cannot read another namespace's path (Vault answers 403), the portal's role `portal-secrets` is write-only, and deleting a TeamNamespace purges its KV data (design: idp-gitops `workloads/vault/README.md`, "Per-namespace access" and "Portal Secrets"). Human-run only, from a laptop with `kubectl` (pointed at the cluster, allowed to create tokens for `vault/vault-proof` and `idp-system/portal-api`, in practice a cluster admin), `jq` and `sha256sum` or `shasum`. No Secret Manager access and no recovery keys are needed. It takes about 3 to 10 minutes. It needs a Vault configured after the `vault-proof` role was added to the config Job (any Vault from a `make up` after that change); an older Vault needs a rebuild.
 
 ```sh
 ./scripts/vault-proof.sh             # run the proof
@@ -83,22 +77,20 @@ Use the token for the task at hand, then revoke it (`vault token revoke -self`).
 
 What it creates and touches (all removed again on exit, also on failure or Ctrl-C):
 
-- a `generate-root` attempt with the recovery keys (2 of 3). The root token is decoded on the laptop with shell builtins, sent on `kubectl exec -i` stdin to one exec in `vault-0` that writes policy `vault-proof` and creates an **orphan admin token** (not renewable, only `kv/vproof-a/` and `kv/vproof-b/`, read of role `portal-secrets`, delete of its own policy, plus the default policy so it can revoke itself after that), then revokes the root token. The TTL covers the worst-case run (all waits plus 15 minutes, at least 45 minutes, printed); the cleanup revokes it as soon as it is done. It refuses to overwrite a `vault-proof` policy with different content, and deletes the policy in the cleanup.
+- a **proof token**: a 10-minute ServiceAccount token for `vault/vault-proof` (audience `vault`, `kubectl create token`) is sent on `kubectl exec -i` stdin to `vault write auth/kubernetes/login role=vault-proof jwt=-` in `vault-0`. The Vault token (policy `vault-proof` only: `kv/vproof-a/`, `kv/vproof-b/`, read of role `portal-secrets`, lookup/revoke of itself; 1 hour, not renewable) is checked to carry exactly that policy and revoked by the cleanup. No root token, no `generate-root`, no policy is written or deleted. The default PROOF_* timeouts fit in the hour; the script warns if yours do not.
 - TeamNamespaces `vproof-a` and `vproof-b` (label `idp.ithaca-idp.com/vault-proof=true`, owner `verify@example.com`), the namespaces and objects the operator creates for them, VaultStaticSecrets and the Secrets VSO writes in them, and `kv/vproof-a/hello`, `kv/vproof-b/hello` (random values).
 - P7 (only if role `portal-secrets` exists): a 10-minute ServiceAccount token for `idp-system/portal-api` (audience `vault`), a Vault login with it, one key `kv/vproof-a/p7-<random>` (deleted right away) and write attempts to `kv/vault-demo/` and `kv/idp-system/` that must be denied (removed again, or listed for you, if they were not).
-- It refuses to start if `vproof-a` or `vproof-b` already exists (only `--cleanup` removes ones carrying its label; anything else is never touched) or if a `generate-root` attempt is in progress.
+- It refuses to start if `vproof-a` or `vproof-b` already exists (only `--cleanup` removes ones carrying its label; anything else is never touched) or if ServiceAccount `vault/vault-proof` is missing.
 
-Secrets (recovery keys, OTP, root, admin and portal tokens, test values) only live in 0600 files in a private temp dir and in pipes, never in argv, env or output; values are compared by sha256.
+Secrets (ServiceAccount JWTs, proof and portal Vault tokens, test values) only live in 0600 files in a private temp dir and in pipes, never in argv, env or output; values are compared by sha256.
 
-**If the root token cannot be revoked** (minting the admin token failed and the cleanup's revoke failed too), the script does NOT delete it: it prints a loud warning with the path of the 0600 file and the exact command that revokes it with the token on stdin (`kubectl -n vault exec -i vault-0 -- sh -c '... vault token revoke -self ...' < <file>`). Run it, then delete the file; if it fails, rebuild Vault.
-
-**If the admin token expired or stopped working** before the cleanup, the cleanup lists every KV key this run wrote and could not remove, each with `vault kv metadata delete -mount=kv <key>` (needs an admin token, see "Getting an admin token later"), and reports policy `vault-proof` as left over. The operator also purges `kv/vproof-a/` and `kv/vproof-b/` whenever a TeamNamespace of that name is created or deleted.
+**If the proof token expired or stopped working** before the cleanup, the cleanup lists every KV key this run wrote and could not remove. Keys under `kv/vproof-a/` and `kv/vproof-b/` go away by themselves: the operator purges them whenever a TeamNamespace of that name is created or deleted (so the next run starts clean). A key elsewhere (only if P7 found a platform path writable) can only be removed by rebuilding Vault. A token that could not be revoked dies after at most 1 hour.
 
 Expected output (abridged):
 
 ```
 ==> 1. preflight ... PASS  preflight
-==> 2. short-lived admin token ... PASS  admin token: orphan, policy vault-proof, TTL 2700s; root token revoked
+==> 2. short-lived admin token ... PASS  admin token: role and policy vault-proof, TTL 3600s, not renewable
 ==> 3. TeamNamespaces vproof-a and vproof-b ... PASS  ... VaultReady=True, ServiceAccount and VaultAuth vault-reader
 ==> 4. write kv/vproof-a/hello and kv/vproof-b/hello ... PASS
 ==> 5. positive
@@ -121,8 +113,7 @@ Expected output (abridged):
     PASS  P5 deleting vproof-a purged kv/vproof-a/ and left kv/vproof-b/hello intact
     PASS  P6 deleting vproof-b purged kv/vproof-b/; kv/vproof-a/ and kv/vproof-b/ are both gone
 ==> cleanup
-    deleted policy vault-proof
-    revoked the admin token
+    revoked the vault-proof token
 ===== vault-proof.sh summary (took ...) =====
 RESULT: all proofs passed
 ```
@@ -133,9 +124,10 @@ The metadata checks of P7 (read/list on `kv/metadata/<ns>/` denied) expect the t
 |---|---|
 | `setup: ... leftover of an earlier run` | An interrupted run left `vproof-*`: run `--cleanup`, then retry. |
 | `setup: ... not created by this script` | Someone else owns that name; the script will not touch it. |
-| `setup: ... generate-root attempt is already in progress` | Another admin, or a killed run. Cancel it (command printed) only if it is yours. |
-| `setup: policy vault-proof already exists ... did not write` | Someone else uses that policy name; it is not touched. Inspect it before anything else. |
-| `setup: submitting recovery key ...` / `could not decode` / `admin token step` | `vault-recovery-keys` `latest` does not belong to this Vault, or Vault refused. A root token that was generated but not revoked is revoked by the cleanup; if that fails, see "If the root token cannot be revoked". |
+| `setup: ServiceAccount vault/vault-proof is missing` / `Vault has no Kubernetes auth role vault-proof` | The cluster or its Vault predates the `vault-proof` role. The config Job only configures a fresh Vault: rebuild (`make down` / `make up`). |
+| `setup: could not get a token for ServiceAccount vault/vault-proof` | Your kubectl identity may not create tokens in namespace `vault`. |
+| `setup: could not log in to Vault with role vault-proof` | Role bound differently, audience mismatch, or Vault cannot reach the TokenReview API (`kubectl -n vault logs vault-0`). |
+| `setup: role vault-proof issued a token with policies ...` | The role grants more (or other) than policy `vault-proof`: someone changed it. Inspect before anything else; the token was revoked. |
 | `setup: TeamNamespace ... Ready` / `VaultReady` | Operator problem (`kubectl -n idp-system logs deploy/idp-operator`); often the initial purge cannot log in to Vault. |
 | `P1`/`P2` did not appear | VSO cannot log in with role `ns-reader` or read its own path: check the VaultStaticSecret events, the `ns-reader` policy/role (config Job), the VaultConnection. |
 | `P1`/`P2` holds a different value | VSO synced something other than what was written: stale Secret or wrong path. |
@@ -166,8 +158,8 @@ On a lab rebuild, `make down` / `make up` does the same.
 - **Initialized but sealed** (`bootstrap-secrets.sh` or `verify.sh` fails with the KMS hint): `kubectl -n vault logs vault-0`. `PermissionDenied` on the key means the GSA grants or the Workload Identity binding are missing (was `envs/persistent` applied?), or the KSA lacks the `iam.gke.io/gcp-service-account` annotation. Wrong project/location/ring/key in the seal stanza shows as `NotFound`.
 - **Recovery keys older than Vault's disk** ("may have been initialized by someone else"): do not use this Vault; rebuild it.
 - **Init output lost** (init errored but Vault is initialized, or storing `vault-recovery-keys` failed, or the run was interrupted): this Vault cannot be recovered. Rebuild it.
-- **Bootstrap token step failed** (login, policy write, token creation or root revocation): the recovery keys are already in Secret Manager. Get a token with `generate-root` and finish by hand, or rebuild. If only the root revocation failed, the root token is still valid but held by nobody; rebuild to be safe.
-- **Initialized, not configured, `vault/vault-bootstrap` gone** (the 30-minute token expired before the Job ran, or a run failed after init): `generate-root` and finish by hand, or rebuild.
+- **Bootstrap token step failed** (login, policy write, token creation or root revocation): rebuild. The recovery keys cannot mint a root token without an existing token in Vault 2.0 ("Admin access after the bootstrap"). If only the root revocation failed, the root token is still valid but held by nobody; rebuild to be safe.
+- **Initialized, not configured, `vault/vault-bootstrap` gone** (the 30-minute token expired before the Job ran, or a run failed after init): rebuild.
 - **The config Job never finishes:** it waits for `vault/vault-bootstrap`; re-run `./scripts/bootstrap-secrets.sh` once `vault-0` is Running.
 
 ## Security notes

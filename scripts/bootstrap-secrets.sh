@@ -272,7 +272,7 @@ vault_status() {
 
 vault_kms_hint="auto-unseal with Cloud KMS is failing. Check: kubectl -n $VAULT_NAMESPACE logs $VAULT_POD (look for gcpckms or PermissionDenied), the KSA $VAULT_NAMESPACE/vault annotation iam.gke.io/gcp-service-account, and the vault GSA's grants on KMS key vault-unseal (envs/persistent applied?). See docs/vault.md."
 vault_rebuild="Rebuild Vault: kubectl -n $VAULT_NAMESPACE delete pvc $VAULT_PVC --wait=false; kubectl -n $VAULT_NAMESPACE delete pod $VAULT_POD; then re-run ./scripts/bootstrap-secrets.sh (docs/vault.md, 'Rebuild Vault')."
-vault_genroot="The recovery keys are in Secret Manager $SM_VAULT_RECOVERY: get an admin token with 'vault operator generate-root' (docs/vault.md) and finish by hand, or: $vault_rebuild"
+vault_noadmin="No admin token can be obtained afterwards: Vault 2.0 requires a valid token for generate-root, so the recovery keys in $SM_VAULT_RECOVERY alone do not help (docs/vault.md, 'Admin access after the bootstrap'). $vault_rebuild"
 
 wait_unsealed() {
   local deadline=$((SECONDS + VAULT_UNSEAL_TIMEOUT))
@@ -382,7 +382,7 @@ if [ "$VAULT_INIT" = true ]; then
   elif kubectl -n "$VAULT_NAMESPACE" get secret "$VAULT_K8S_SECRET" >/dev/null 2>&1; then
     echo "bootstrap-secrets ok: Vault is initialized and unsealed; the config Job has not finished yet (Secret $VAULT_NAMESPACE/$VAULT_K8S_SECRET is present)"
   else
-    die "Vault is initialized but not configured, and Secret $VAULT_NAMESPACE/$VAULT_K8S_SECRET is gone (a run that failed after init, or the 30-minute bootstrap token was never used). The root token is not stored anywhere. $vault_genroot"
+    die "Vault is initialized but not configured, and Secret $VAULT_NAMESPACE/$VAULT_K8S_SECRET is gone (a run that failed after init, or the 30-minute bootstrap token was never used). The root token is not stored anywhere. $vault_noadmin"
   fi
   exit 0
 fi
@@ -414,7 +414,7 @@ gcloud secrets versions add "$SM_VAULT_RECOVERY" --data-file="$tmp/vault-recover
 rm -f "$tmp/vault-recovery-keys"
 echo "bootstrap-secrets: stored a new version of $SM_VAULT_RECOVERY in Secret Manager"
 
-wait_unsealed || die "Vault was initialized but is still sealed after ${VAULT_UNSEAL_TIMEOUT}s: $vault_kms_hint Once it unseals: $vault_genroot"
+wait_unsealed || die "Vault was initialized but is still sealed after ${VAULT_UNSEAL_TIMEOUT}s: $vault_kms_hint Once it unseals: $vault_noadmin"
 
 # Root token in on STDIN only (first line), policy after it; the orphan token JSON comes back on STDOUT.
 {
@@ -425,19 +425,19 @@ wait_unsealed || die "Vault was initialized but is still sealed after ${VAULT_UN
 rm -f "$tmp/vault-root-token"
 case "$rc" in
   0) ;;
-  10) die "could not log in with the root token: $(head -n 1 "$tmp/err"). $vault_genroot" ;;
-  11) die "could not write policy vault-bootstrap: $(head -n 1 "$tmp/err"). The root token is still valid but stored nowhere. $vault_genroot" ;;
-  12) die "could not create the bootstrap token: $(head -n 1 "$tmp/err"). The root token is still valid but stored nowhere. $vault_genroot" ;;
+  10) die "could not log in with the root token: $(head -n 1 "$tmp/err"). $vault_noadmin" ;;
+  11) die "could not write policy vault-bootstrap: $(head -n 1 "$tmp/err"). The root token is still valid but stored nowhere. $vault_noadmin" ;;
+  12) die "could not create the bootstrap token: $(head -n 1 "$tmp/err"). The root token is still valid but stored nowhere. $vault_noadmin" ;;
   13) die "could not revoke the root token: $(head -n 1 "$tmp/err"). It is still valid but stored nowhere; to be safe: $vault_rebuild" ;;
-  *) die "the bootstrap step in $VAULT_POD failed (exit $rc): $(head -n 1 "$tmp/err"). The root token may still be valid but is stored nowhere. $vault_genroot" ;;
+  *) die "the bootstrap step in $VAULT_POD failed (exit $rc): $(head -n 1 "$tmp/err"). The root token may still be valid but is stored nowhere. $vault_noadmin" ;;
 esac
 jq -j '.auth.client_token // ""' "$tmp/vault-orphan.json" >"$tmp/vault-bootstrap-token" 2>/dev/null || true
 rm -f "$tmp/vault-orphan.json"
-[ -s "$tmp/vault-bootstrap-token" ] || die "no bootstrap token in the token create output (the root token was revoked). $vault_genroot"
+[ -s "$tmp/vault-bootstrap-token" ] || die "no bootstrap token in the token create output (the root token was revoked). $vault_noadmin"
 
 # `kubectl create`, not `apply`: apply would copy the token into the last-applied annotation.
 kubectl -n "$VAULT_NAMESPACE" delete secret "$VAULT_K8S_SECRET" --ignore-not-found >/dev/null 2>&1 || true
 kubectl -n "$VAULT_NAMESPACE" create secret generic "$VAULT_K8S_SECRET" \
   --from-file=token="$tmp/vault-bootstrap-token" >/dev/null 2>"$tmp/err" \
-  || die "could not create Secret $VAULT_NAMESPACE/$VAULT_K8S_SECRET: $(head -n 1 "$tmp/err"). $vault_genroot"
+  || die "could not create Secret $VAULT_NAMESPACE/$VAULT_K8S_SECRET: $(head -n 1 "$tmp/err"). $vault_noadmin"
 echo "bootstrap-secrets ok: Vault initialized and unsealed by Cloud KMS; root token revoked; Secret $VAULT_NAMESPACE/$VAULT_K8S_SECRET holds a 30-minute bootstrap token for the config Job (value not shown)"
