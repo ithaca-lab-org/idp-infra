@@ -155,9 +155,11 @@ kv_state() {
   if [ "$rc" = 0 ]; then
     n="$(jq 'if type == "array" then length else (.keys // [] | length) end' "$tmp/list.json" 2>/dev/null || echo x)"
     case "$n" in 0) echo gone ;; x) echo error ;; *) echo present ;; esac
-  elif [ "$rc" = 2 ] && grep -q 'No value found' "$tmp/err"; then
+  elif grep -q 'No value found' "$tmp/err"; then
+    # kubectl exec need not pass vault's exit code 2 through, so match the message only.
     echo gone
   else
+    printf "exit %s: %s" "$rc" "$(first_err)" >"$tmp/kv-err"
     echo error
   fi
   rm -f "$tmp/list.json"
@@ -640,7 +642,7 @@ if delete_if_ours "$NS_A"; then
   if [ "$sa" = gone ] && [ "$sb" = present ] && [ "$hb" = "$HASH_B" ]; then
     ppass "P5 deleting $NS_A purged kv/$NS_A/ and left kv/$NS_B/hello intact"
   else
-    pfail "P5 after deleting $NS_A: kv/$NS_A/ is $sa (want gone), kv/$NS_B/ is $sb (want present), kv/$NS_B/hello $([ "$hb" = "$HASH_B" ] && echo unchanged || echo 'changed or unreadable')"
+    pfail "P5 after deleting $NS_A (last list error: $(cat "$tmp/kv-err" 2>/dev/null || echo none)): kv/$NS_A/ is $sa (want gone), kv/$NS_B/ is $sb (want present), kv/$NS_B/hello $([ "$hb" = "$HASH_B" ] && echo unchanged || echo 'changed or unreadable')"
   fi
 else
   pfail "P5 TeamNamespace $NS_A or its namespace was not removed within ${DELETE_TIMEOUT}s (VaultPurgePending? kubectl get teamnamespace $NS_A -o yaml)"
