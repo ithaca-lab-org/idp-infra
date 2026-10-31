@@ -155,8 +155,10 @@ kv_state() {
   if [ "$rc" = 0 ]; then
     n="$(jq 'if type == "array" then length else (.keys // [] | length) end' "$tmp/list.json" 2>/dev/null || echo x)"
     case "$n" in 0) echo gone ;; x) echo error ;; *) echo present ;; esac
-  elif grep -q 'No value found' "$tmp/err"; then
-    # kubectl exec need not pass vault's exit code 2 through, so match the message only.
+  elif grep -q 'No value found' "$tmp/err" \
+    || { [ "$rc" = 2 ] && ! grep -qiE 'error|denied|403|unavailable|refused' "$tmp/err"; }; then
+    # Observed (Vault 2.0.4, -format=json): a missing path exits 2 and prints nothing but
+    # kubectl's "terminated with exit code 2". Vault also exits 2 on API errors, but those say so.
     echo gone
   else
     printf "exit %s: %s" "$rc" "$(first_err)" >"$tmp/kv-err"
