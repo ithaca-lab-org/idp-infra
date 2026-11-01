@@ -12,7 +12,8 @@
 #            (creates and deletes a throwaway TeamNamespace; skip it with VERIFY_SMOKE=0). With
 #            VAULT_ENABLED on the operator it also checks the namespace got its Vault access objects.
 #        (8) vault: vault-0 Running and ready, Vault initialized and unsealed (Cloud KMS), the listener
-#            serves verified TLS (in-cluster CA) on the Service name and refuses plain HTTP, and the
+#            serves verified TLS (in-cluster CA) on the Service name with the certificate currently in
+#            its Secret and refuses plain HTTP, and the
 #            VSO demo Secret vault-demo/hello has key message (value never printed). Needs jq.
 # Bash 3.2 compatible (macOS): no associative arrays, no grep -P.
 set -euo pipefail
@@ -380,6 +381,27 @@ if kubectl get applications.argoproj.io vault -n argocd >/dev/null 2>&1; then
   else
     fail "TLS to https://vault.vault.svc.cluster.local:8200 failed verification or Vault is not unsealed: $(printf '%s' "$verr" | grep -v '^$' | head -n 3 | tr '\n' ' ')"
   fi
+  # The served certificate must be the one in the Secret: after a renewal, a failed tls-reload
+  # SIGHUP leaves Vault on the old one (still valid and CA-signed, so the check above passes). The
+  # pod has no openssl, so this pins the Secret's leaf (first PEM block of tls.crt) as the ONLY
+  # trusted root: Go accepts a root identical to the served leaf and rejects any other certificate,
+  # even one from the same CA. Retries cover the kubelet's Secret refresh plus the sidecar's 60 s
+  # poll right after a renewal.
+  # shellcheck disable=SC2016
+  LEAF_CHECK='f=/tmp/verify-served-leaf.pem
+awk "/-BEGIN CERTIFICATE-/{n++} n==1" /vault/userconfig/vault-server-tls/tls.crt >"$f" || exit 1
+VAULT_CACERT="$f" vault status >/dev/null 2>&1
+rc=$?
+rm -f "$f"
+exit "$rc"'
+  deadline=$((SECONDS + 180))
+  until kubectl -n vault exec vault-0 -c vault -- sh -c "$LEAF_CHECK" >/dev/null 2>&1; do
+    [ "$SECONDS" -ge "$deadline" ] \
+      && fail "Vault serves a different certificate than Secret vault/vault-server-tls for 180s: the tls-reload sidecar did not reload it (kubectl -n vault logs vault-0 -c tls-reload; a human may run kubectl -n vault delete pod vault-0; idp-gitops workloads/vault/README.md, \"TLS listener\")"
+    info "served certificate differs from the Secret (renewal in progress?), retrying"
+    sleep "$INTERVAL"
+  done
+  pass "Vault serves the current certificate from Secret vault/vault-server-tls (reload works)"
   # Plain HTTP must not be served: Vault's TLS listener answers 400 "Client sent an HTTP request to
   # an HTTPS server", so the CLI exits non-zero.
   if pout="$(kubectl -n vault exec vault-0 -c vault -- sh -c 'VAULT_ADDR=http://127.0.0.1:8200 vault status' 2>&1)"; then
