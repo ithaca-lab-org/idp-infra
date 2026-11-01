@@ -24,6 +24,7 @@ envs/persistent (CI)                  idp-gitops (Argo CD)                    ma
 | GSA `vault-server` | `roles/cloudkms.viewer` (the seal needs `cloudkms.cryptoKeys.get`) | key `vault-unseal` only |
 | KSA `vault/vault` (project pool `<project>.svc.id.goog`) | `roles/iam.workloadIdentityUser` | GSA `vault-server` only |
 
+- **TLS listener** (ADR 0008): a cert-manager in-cluster CA (no Let's Encrypt) signs `vault/vault-server-tls` (7 days, renewed 3 days before expiry; a sidecar sends Vault a SIGHUP to reload it). Inside `vault-0` the chart sets `VAULT_ADDR=https://127.0.0.1:8200` and the values add `VAULT_CACERT`, so every `kubectl exec vault-0 -- vault ...` in these scripts verifies TLS with no script change. The `vault-proof` token's `token_bound_cidrs=127.0.0.1/32` still holds: the source address of an in-pod call is 127.0.0.1 with or without TLS. Clients outside the pod: idp-gitops `workloads/vault/README.md`, "TLS listener".
 - **Outputs** of `envs/persistent` for the Helm values: `vault_kms_project`, `vault_kms_location`, `vault_kms_key_ring`, `vault_kms_crypto_key`, `vault_sa` (KSA annotation `iam.gke.io/gcp-service-account`).
 
 ## Who holds what
@@ -44,14 +45,14 @@ The bootstrap token's policy is defined once, in `VAULT_BOOTSTRAP_POLICY` in `sc
 ## Init flow (every `make up`)
 
 1. `bootstrap-secrets.sh` checks whether Argo CD deploys the `vault` Application. If the root app `argocd-root` does not list it, the script prints a notice and skips (not a failure). If it is listed but not created yet (earlier sync waves), it waits up to `VAULT_APP_TIMEOUT` (900 s) and then **fails** ("re-run the script"): an uninitialized Vault must not be left for someone else to initialize.
-2. It waits up to `VAULT_POD_TIMEOUT` (600 s) for `vault-0` to be Running with its API answering (`vault status` exit code 0 = unsealed, 2 = sealed or uninitialized, 1 = error).
+2. It waits up to `VAULT_POD_TIMEOUT` (600 s) for `vault-0` to be Running with its API answering (`vault status` exit code 0 = unsealed, 2 = sealed or uninitialized, 1 = error). Argo CD creates `vault-0` only after Certificate `vault/vault-server-tls` is Ready, so on a timeout the error names that Certificate's state and the last `vault status` error (an x509 message means a TLS problem).
 3. **Not initialized:** it creates `vault-recovery-keys` if missing (before init, so a permission problem cannot lose the output), runs `vault operator init -recovery-shares=3 -recovery-threshold=2`, adds a new version of `vault-recovery-keys`, waits for KMS auto-unseal, then sends the root token on stdin to a short script in `vault-0` that writes policy `vault-bootstrap`, creates an orphan token with it (orphan, so revoking root does not revoke it) and revokes the root token. The bootstrap token goes into Secret `vault/vault-bootstrap` with `kubectl create` (not `apply`, which would copy it into the last-applied annotation).
 4. **Already initialized:** never re-initialized. The script then requires that
    - Vault unseals within `VAULT_UNSEAL_TIMEOUT` (120 s), else it fails (KMS problem, see Troubleshooting);
    - the latest `vault-recovery-keys` version is newer than PVC `data-vault-0` (the pod if there is no PVC). Otherwise someone else may have initialized this Vault (front-running) and holds its keys: the script fails and asks for a rebuild;
    - Vault is configured (`kubernetes/` visible in the unauthenticated `sys/internal/ui/mounts`, the same test the config Job uses), or `vault/vault-bootstrap` still exists (Job pending). Initialized, unconfigured and no Secret: it fails with the recovery options below. It does not recreate the Secret: the root token is not stored.
 5. The config Job (`idp-gitops`) waits for `vault/vault-bootstrap`, enables KV, Kubernetes auth, policies and the demo (`kv/vault-demo/hello`), revokes its token and deletes the Secret.
-6. `verify.sh` step 8 checks `vault-0`, `Initialized true` / `Sealed false`, and that VSO synced Secret `vault-demo/hello` (key `message`; the value is never printed).
+6. `verify.sh` step 8 checks `vault-0`, `Initialized true` / `Sealed false`, the TLS listener (Certificate Ready, in-pod `VAULT_ADDR` is https with a CA, `vault status` verifies through `https://vault.vault.svc.cluster.local:8200`, plain `http://127.0.0.1:8200` is refused), and that VSO synced Secret `vault-demo/hello` (key `message`; the value is never printed).
 
 **Rebuilds:** Vault's data dies with the cluster, so each `make up` initializes a brand-new Vault and adds a new version of `vault-recovery-keys`. Older versions belong to a destroyed Vault and are useless (disable them whenever convenient: `gcloud secrets versions disable <n> --secret=vault-recovery-keys`). Only `latest` matters. KV data written by hand is lost too: anything that must survive belongs in Git (config Job) or in the portal flow that writes it again.
 
@@ -164,6 +165,8 @@ On a lab rebuild, `make down` / `make up` does the same.
 - **Init output lost** (init errored but Vault is initialized, or storing `vault-recovery-keys` failed, or the run was interrupted): this Vault cannot be recovered. Rebuild it.
 - **Bootstrap token step failed** (login, policy write, token creation or root revocation): rebuild. The recovery keys cannot mint a root token without an existing token in Vault 2.0 ("Admin access after the bootstrap"). If only the root revocation failed, the root token is still valid but held by nobody; rebuild to be safe.
 - **Initialized, not configured, `vault/vault-bootstrap` gone** (the 30-minute token expired before the Job ran, or a run failed after init): rebuild.
+- **No `vault-0` at all / bootstrap times out with "TLS certificate ... not Ready":** `kubectl -n vault describe certificate vault-server-tls`, `kubectl get clusterissuer vault-ca`, `kubectl -n cert-manager get certificate vault-ca`, `kubectl -n cert-manager logs deploy/cert-manager`. An admission denial mentioning `vault-ca-scope` means a Certificate for ClusterIssuer `vault-ca` was created outside `vault`, `vault-secrets-operator`, `idp-system`.
+- **x509 errors** (`vault status`, VSO VaultConnection events, portal-api `vault request failed`, operator purge retries): the client's CA is missing or stale. Clients read `ca.crt` once at start; restart them after the CA changed (only happens if `cert-manager/vault-ca` was re-issued).
 - **The config Job never finishes:** it waits for `vault/vault-bootstrap`; re-run `./scripts/bootstrap-secrets.sh` once `vault-0` is Running.
 
 ## Security notes
@@ -179,5 +182,4 @@ Vault 1.15 and later (community edition included) is under the Business Source L
 ## Follow-ups (not in Phase 1b)
 
 - **Raft snapshots to GCS** on a schedule (a CronJob with a snapshot-only policy and a bucket-scoped GSA), so KV data can survive a rebuild via `vault operator raft snapshot restore`.
-- **TLS on the Vault listener** with a cert-manager Certificate (in-cluster CA); until then the listener is plain HTTP, reachable in-cluster only.
 - **Cloud SQL is out of scope**: databases stay in-cluster (CloudNativePG) with Vault dynamic credentials (section 10.4).

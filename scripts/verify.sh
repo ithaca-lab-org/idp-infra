@@ -11,7 +11,8 @@
 #        (7) portal stack: lldap seed, MongoDB, portal, operator, notifier and an end-to-end order smoke test
 #            (creates and deletes a throwaway TeamNamespace; skip it with VERIFY_SMOKE=0). With
 #            VAULT_ENABLED on the operator it also checks the namespace got its Vault access objects.
-#        (8) vault: vault-0 Running and ready, Vault initialized and unsealed (Cloud KMS), and the
+#        (8) vault: vault-0 Running and ready, Vault initialized and unsealed (Cloud KMS), the listener
+#            serves verified TLS (in-cluster CA) on the Service name and refuses plain HTTP, and the
 #            VSO demo Secret vault-demo/hello has key message (value never printed). Needs jq.
 # Bash 3.2 compatible (macOS): no associative arrays, no grep -P.
 set -euo pipefail
@@ -328,7 +329,7 @@ else
 fi
 
 # --- 8. vault ---------------------------------------------------------------
-step 8 "vault (initialized, unsealed by Cloud KMS, VSO demo secret)"
+step 8 "vault (initialized, unsealed by Cloud KMS, TLS listener, VSO demo secret)"
 if kubectl get applications.argoproj.io vault -n argocd >/dev/null 2>&1; then
   command -v jq >/dev/null 2>&1 || fail "jq not found on PATH (needed to read vault status)"
 
@@ -344,7 +345,7 @@ if kubectl get applications.argoproj.io vault -n argocd >/dev/null 2>&1; then
       *) [ "${ready%/*}" = "${ready#*/}" ] && break ;;
     esac
     [ "$SECONDS" -ge "$deadline" ] \
-      && fail "statefulset vault in vault is not ready (${ready:-not found}; not initialized? run ./scripts/bootstrap-secrets.sh; kubectl -n vault logs vault-0)"
+      && fail "statefulset vault in vault is not ready (${ready:-not found}; not initialized? run ./scripts/bootstrap-secrets.sh; kubectl -n vault logs vault-0; no StatefulSet: is Certificate vault/vault-server-tls Ready? kubectl -n vault describe certificate vault-server-tls)"
     info "statefulset vault ready ${ready:-?}, retrying"
     sleep "$INTERVAL"
   done
@@ -361,6 +362,33 @@ if kubectl get applications.argoproj.io vault -n argocd >/dev/null 2>&1; then
   [ "$vrc" = 0 ] && [ "$vsealed" = false ] \
     || fail "Vault is initialized but sealed (vault status exit $vrc): KMS auto-unseal failing, see kubectl -n vault logs vault-0 and docs/vault.md"
   pass "Vault is initialized and unsealed (seal type: ${vtype:-unknown})"
+
+  # TLS listener (idp-gitops workloads/vault/tls.yaml, idp-infra ADR 0008). The in-pod CLI verifies
+  # with VAULT_CACERT (the in-cluster CA only). The status output holds no secrets.
+  cready="$(kubectl -n vault get certificate vault-server-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+  [ "$cready" = True ] || fail "Certificate vault/vault-server-tls is not Ready (kubectl -n vault describe certificate vault-server-tls)"
+  # Single quotes: the variables expand inside vault-0, not here.
+  # shellcheck disable=SC2016
+  vaddr="$(kubectl -n vault exec vault-0 -c vault -- sh -c 'printf "%s %s" "$VAULT_ADDR" "${VAULT_CACERT:-}"' 2>/dev/null || true)"
+  case "$vaddr" in
+    "https://127.0.0.1:8200 /"*) ;;
+    *) fail "vault-0 has VAULT_ADDR/VAULT_CACERT '${vaddr:-unknown}', expected https://127.0.0.1:8200 and a CA file (idp-gitops platform/vault/values.yaml)" ;;
+  esac
+  # The Service name VSO, portal-api and idp-operator use: certificate SAN and chain verified.
+  if verr="$(kubectl -n vault exec vault-0 -c vault -- sh -c 'VAULT_ADDR=https://vault.vault.svc.cluster.local:8200 vault status' 2>&1 >/dev/null)"; then
+    pass "Vault serves TLS verified against the in-cluster CA (127.0.0.1 and vault.vault.svc.cluster.local)"
+  else
+    fail "TLS to https://vault.vault.svc.cluster.local:8200 failed verification or Vault is not unsealed: $(printf '%s' "$verr" | grep -v '^$' | head -n 3 | tr '\n' ' ')"
+  fi
+  # Plain HTTP must not be served: Vault's TLS listener answers 400 "Client sent an HTTP request to
+  # an HTTPS server", so the CLI exits non-zero.
+  if pout="$(kubectl -n vault exec vault-0 -c vault -- sh -c 'VAULT_ADDR=http://127.0.0.1:8200 vault status' 2>&1)"; then
+    fail "Vault answered plain HTTP on 127.0.0.1:8200: the listener is not TLS-only (tls_disable set?)"
+  fi
+  case "$pout" in
+    *"HTTP request to an HTTPS server"*) pass "plain HTTP is refused (400: HTTP request to an HTTPS server)" ;;
+    *) pass "plain HTTP is refused ($(printf '%s' "$pout" | grep -v '^$' | head -n 1))" ;;
+  esac
 
   # Only checks that the key exists and is not empty: the template never outputs the value.
   info "waiting up to 180s for Secret vault-demo/hello (synced by VSO from kv/vault-demo/hello)"

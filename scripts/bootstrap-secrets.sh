@@ -270,6 +270,20 @@ vault_status() {
   VAULT_SEALED="$(printf '%s' "$out" | jq -r 'if (.sealed | type) == "boolean" then .sealed else "" end' 2>/dev/null || true)"
 }
 
+# Vault's listener uses TLS from the cert-manager Certificate vault/vault-server-tls (idp-gitops
+# workloads/vault/tls.yaml). Argo CD creates the StatefulSet only after that Certificate is Ready,
+# so a stuck certificate shows up here as "no vault-0". Prints a hint, or nothing when it is Ready.
+vault_tls_hint() {
+  local ready msg
+  ready="$(kubectl -n "$VAULT_NAMESPACE" get certificate vault-server-tls \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+  [ "$ready" = True ] && return 0
+  msg="$(kubectl -n "$VAULT_NAMESPACE" get certificate vault-server-tls \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null || true)"
+  printf ' TLS certificate %s/vault-server-tls is not Ready (%s): Argo CD creates vault-0 only after it is. Check: kubectl -n %s describe certificate vault-server-tls; kubectl get clusterissuer vault-ca; kubectl -n cert-manager get certificate vault-ca; kubectl -n cert-manager logs deploy/cert-manager (idp-gitops workloads/vault/README.md, "TLS listener").' \
+    "$VAULT_NAMESPACE" "${msg:-${ready:-certificate not found}}" "$VAULT_NAMESPACE"
+}
+
 vault_kms_hint="auto-unseal with Cloud KMS is failing. Check: kubectl -n $VAULT_NAMESPACE logs $VAULT_POD (look for gcpckms or PermissionDenied), the KSA $VAULT_NAMESPACE/vault annotation iam.gke.io/gcp-service-account, and the vault GSA's grants on KMS key vault-unseal (envs/persistent applied?). See docs/vault.md."
 vault_rebuild="Rebuild Vault: kubectl -n $VAULT_NAMESPACE delete pvc $VAULT_PVC --wait=false; kubectl -n $VAULT_NAMESPACE delete pod $VAULT_POD; then re-run ./scripts/bootstrap-secrets.sh (docs/vault.md, 'Rebuild Vault')."
 vault_noadmin="No admin token can be obtained afterwards: Vault 2.0 requires a valid token for generate-root, so the recovery keys in $SM_VAULT_RECOVERY alone do not help (docs/vault.md, 'Admin access after the bootstrap'). $vault_rebuild"
@@ -365,8 +379,12 @@ while :; do
     vault_status
     [ -n "$VAULT_INIT" ] && [ -n "$VAULT_SEALED" ] && break
   fi
-  [ "$SECONDS" -ge "$deadline" ] \
-    && die "pod $VAULT_NAMESPACE/$VAULT_POD is not Running with its API answering after ${VAULT_POD_TIMEOUT}s (phase: ${phase:-none}; kubectl -n $VAULT_NAMESPACE describe pod $VAULT_POD; kubectl -n $VAULT_NAMESPACE logs $VAULT_POD)"
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    # The last `vault status` error (no secrets in it) shows TLS problems, e.g. an x509 error.
+    lasterr=""
+    [ "$phase" = Running ] && [ -s "$tmp/err" ] && lasterr="; last vault status error: $(head -n 1 "$tmp/err")"
+    die "pod $VAULT_NAMESPACE/$VAULT_POD is not Running with its API answering after ${VAULT_POD_TIMEOUT}s (phase: ${phase:-none}${lasterr}; kubectl -n $VAULT_NAMESPACE describe pod $VAULT_POD; kubectl -n $VAULT_NAMESPACE logs $VAULT_POD -c vault).$(vault_tls_hint)"
+  fi
   sleep "$VAULT_POLL"
 done
 
