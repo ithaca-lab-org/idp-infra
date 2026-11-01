@@ -11,7 +11,8 @@
 #   2. a short-lived admin token: a 10-minute ServiceAccount token for vault/vault-proof (audience
 #      vault) logs in to Vault's Kubernetes auth role vault-proof (idp-gitops workloads/vault,
 #      "Proof role vault-proof": only kv/vproof-a/ and kv/vproof-b/ plus a read of role
-#      portal-secrets; TTL = max TTL = 1 h, no renew-self, bound to 127.0.0.1). No root token, no generate-root (Vault 2.0 requires a
+#      portal-secrets; TTL = max TTL = 1 h, no renew-self, bound to 127.0.0.1; the in-pod CLI talks
+#      to https://127.0.0.1:8200 with the chart's VAULT_ADDR and VAULT_CACERT). No root token, no generate-root (Vault 2.0 requires a
 #      token for it), no recovery keys.
 #   3. creates the throwaway TeamNamespaces vproof-a and vproof-b (label
 #      idp.ithaca-idp.com/vault-proof=true) and waits for Ready, VaultReady and vault-reader.
