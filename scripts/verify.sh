@@ -294,8 +294,14 @@ spec:
   orderId: ORD-0000-000000
 EOF
     info "waiting up to 180s for the operator to reconcile ${SMOKE_NAME}"
-    kubectl wait --for=jsonpath='{.status.phase}'=Ready "teamnamespace/${SMOKE_NAME}" --timeout=180s >/dev/null \
-      || fail "TeamNamespace ${SMOKE_NAME} did not become Ready (kubectl get teamnamespace ${SMOKE_NAME} -o yaml; kubectl -n idp-system logs deploy/idp-operator)"
+    # Poll: `kubectl wait --for=jsonpath` errors at once ("status is not found") while the operator
+    # has not written .status yet, which made this step flaky.
+    smoke_deadline=$((SECONDS + 180))
+    until [ "$(kubectl get "teamnamespace/${SMOKE_NAME}" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Ready" ]; do
+      [ "$SECONDS" -ge "$smoke_deadline" ] \
+        && fail "TeamNamespace ${SMOKE_NAME} did not become Ready within 180s (phase: $(kubectl get "teamnamespace/${SMOKE_NAME}" -o jsonpath='{.status.phase}' 2>/dev/null || true); kubectl get teamnamespace ${SMOKE_NAME} -o yaml; kubectl -n idp-system logs deploy/idp-operator)"
+      sleep 3
+    done
     kubectl -n "$SMOKE_NAME" get resourcequota/idp-quota limitrange/idp-limits networkpolicy/idp-default-deny-ingress rolebinding/idp-namespace-admin >/dev/null \
       || fail "namespace ${SMOKE_NAME} is missing quota, limits, network policy or the owner binding"
     pass "order smoke test: namespace created with quota, limits, default-deny policy and owner binding"
