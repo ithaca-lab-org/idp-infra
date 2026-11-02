@@ -11,6 +11,9 @@
 #        (7) portal stack: lldap seed, MongoDB, portal, operator, notifier and an end-to-end order smoke test
 #            (creates and deletes a throwaway TeamNamespace; skip it with VERIFY_SMOKE=0). With
 #            VAULT_ENABLED on the operator it also checks the namespace got its Vault access objects.
+#            If the WorkloadIdentity CRD exists and the operator runs its controller, it also creates
+#            a WorkloadIdentity verify-wl there and checks its ServiceAccount, HTTPRoute hostname,
+#            AuthorizationPolicy, SPIFFE ID and (Vault on) VaultAuth; skipped otherwise.
 #        (8) vault: vault-0 Running and ready, Vault initialized and unsealed (Cloud KMS), the listener
 #            serves verified TLS (in-cluster CA) on the Service name with the certificate currently in
 #            its Secret and refuses plain HTTP, and the
@@ -324,6 +327,47 @@ EOF
       pass "order smoke test: namespace has the Vault access objects (vault-reader ServiceAccount and VaultAuth, VaultReady=True)"
     else
       skip "operator runs without VAULT_ENABLED: per-namespace Vault access not checked"
+    fi
+    # Per-workload identity (Order #03): only when the CRD exists and the operator runs the
+    # WorkloadIdentity controller (an operator without the CRDs logs "WorkloadIdentity controller
+    # disabled"). The WorkloadIdentity lives in the smoke namespace, so its removal is covered by
+    # the namespace deletion below (no extra kubectl delete).
+    WL_CRD="workloadidentities.idp.ithaca-idp.com"
+    WL_NAME="verify-wl"
+    if ! kubectl get crd "$WL_CRD" >/dev/null 2>&1; then
+      skip "WorkloadIdentity CRD not installed: per-workload identity not checked"
+    elif kubectl -n idp-system logs deploy/idp-operator --tail=-1 2>/dev/null | grep -q 'WorkloadIdentity controller disabled'; then
+      skip "operator runs without the WorkloadIdentity controller (too old or CRDs added after it started): per-workload identity not checked"
+    else
+      kubectl apply -f - >/dev/null <<EOF || fail "could not create the smoke-test WorkloadIdentity"
+apiVersion: idp.ithaca-idp.com/v1alpha1
+kind: WorkloadIdentity
+metadata:
+  name: ${WL_NAME}
+  namespace: ${SMOKE_NAME}
+spec: {}
+EOF
+      info "waiting up to 120s for the operator to sync WorkloadIdentity ${WL_NAME}"
+      wdeadline=$((SECONDS + 120))
+      until [ "$(kubectl -n "$SMOKE_NAME" get "workloadidentity/${WL_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Synced")].status}' 2>/dev/null || true)" = "True" ]; do
+        [ "$SECONDS" -ge "$wdeadline" ] \
+          && fail "WorkloadIdentity ${SMOKE_NAME}/${WL_NAME} is not Synced=True within 120s (kubectl -n ${SMOKE_NAME} get workloadidentity ${WL_NAME} -o yaml; kubectl -n idp-system logs deploy/idp-operator)"
+        sleep 3
+      done
+      kubectl -n "$SMOKE_NAME" get "serviceaccount/${WL_NAME}" "httproute/${WL_NAME}" "authorizationpolicy/${WL_NAME}" >/dev/null 2>&1 \
+        || fail "namespace ${SMOKE_NAME} is missing ServiceAccount, HTTPRoute or AuthorizationPolicy ${WL_NAME}"
+      wl_host="$(kubectl -n "$SMOKE_NAME" get "httproute/${WL_NAME}" -o jsonpath='{.spec.hostnames[0]}' 2>/dev/null || true)"
+      [ "$wl_host" = "${WL_NAME}.${SMOKE_NAME}.apps.ithaca-idp.com" ] \
+        || fail "HTTPRoute ${WL_NAME} hostname is '${wl_host:-none}', expected ${WL_NAME}.${SMOKE_NAME}.apps.ithaca-idp.com"
+      wl_spiffe="$(kubectl -n "$SMOKE_NAME" get "workloadidentity/${WL_NAME}" -o jsonpath='{.status.spiffeID}' 2>/dev/null || true)"
+      [ "$wl_spiffe" = "spiffe://cluster.local/ns/${SMOKE_NAME}/sa/${WL_NAME}" ] \
+        || fail "WorkloadIdentity ${WL_NAME} status.spiffeID is '${wl_spiffe:-none}', expected spiffe://cluster.local/ns/${SMOKE_NAME}/sa/${WL_NAME}"
+      pass "order smoke test: WorkloadIdentity ${WL_NAME} synced (ServiceAccount, HTTPRoute ${wl_host}, AuthorizationPolicy, SPIFFE ID ${wl_spiffe})"
+      if [ "$(kubectl -n idp-system get deployment idp-operator -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="VAULT_ENABLED")].value}' 2>/dev/null || true)" = "true" ]; then
+        kubectl -n "$SMOKE_NAME" get "vaultauth/${WL_NAME}" >/dev/null 2>&1 \
+          || fail "namespace ${SMOKE_NAME} has no VaultAuth ${WL_NAME} (VAULT_ENABLED=true; kubectl -n idp-system logs deploy/idp-operator)"
+        pass "order smoke test: WorkloadIdentity ${WL_NAME} has its VaultAuth"
+      fi
     fi
     kubectl delete teamnamespace "$SMOKE_NAME" --wait=false >/dev/null || fail "could not delete the smoke-test TeamNamespace"
     kubectl wait --for=delete "namespace/${SMOKE_NAME}" --timeout=180s >/dev/null \

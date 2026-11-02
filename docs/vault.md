@@ -73,7 +73,7 @@ A real break-glass path (for example a dedicated admin role or an encrypted, acc
 
 ## Proving per-namespace isolation
 
-`verify.sh` only checks that a TeamNamespace gets its `vault-reader` ServiceAccount and VaultAuth. `scripts/vault-proof.sh` proves the rest on a running cluster: a namespace reads its own `kv/<ns>/` through VSO, cannot read another namespace's path (Vault answers 403), the portal's role `portal-secrets` is write-only, and deleting a TeamNamespace purges its KV data (design: idp-gitops `workloads/vault/README.md`, "Per-namespace access" and "Portal Secrets"). Human-run only, from a laptop with `kubectl` (pointed at the cluster, allowed to create tokens for `vault/vault-proof` and `idp-system/portal-api`, in practice a cluster admin), `jq` and `sha256sum` or `shasum`. No Secret Manager access and no recovery keys are needed. It takes about 3 to 10 minutes. It needs a Vault configured after the `vault-proof` role was added to the config Job (any Vault from a `make up` after that change); an older Vault needs a rebuild.
+`verify.sh` only checks that a TeamNamespace gets its `vault-reader` ServiceAccount and VaultAuth. `scripts/vault-proof.sh` proves the rest on a running cluster: a namespace reads its own `kv/<ns>/` through VSO, cannot read another namespace's path (Vault answers 403), the portal's role `portal-secrets` is write-only (P7), a ServiceAccount of any name in a managed namespace reads only `kv/<its namespace>/<its name>/*` through role `workload-reader` and cannot log in from an unlabelled namespace (P8, WorkloadIdentity, ADR 0009), and deleting a TeamNamespace purges its KV data (design: idp-gitops `workloads/vault/README.md`, "Per-namespace access" and "Portal Secrets"). Human-run only, from a laptop with `kubectl` (pointed at the cluster, allowed to create tokens for `vault/vault-proof` and `idp-system/portal-api`, in practice a cluster admin), `jq` and `sha256sum` or `shasum`. No Secret Manager access and no recovery keys are needed. It takes about 3 to 10 minutes. It needs a Vault configured after the `vault-proof` role was added to the config Job (any Vault from a `make up` after that change); an older Vault needs a rebuild.
 
 ```sh
 ./scripts/vault-proof.sh             # run the proof
@@ -85,6 +85,7 @@ What it creates and touches (all removed again on exit, also on failure or Ctrl-
 - a **proof token**: a 10-minute ServiceAccount token for `vault/vault-proof` (audience `vault`, `kubectl create token`) is sent on `kubectl exec -i` stdin to `vault write auth/kubernetes/login role=vault-proof jwt=-` in `vault-0`. The Vault token (policy `vault-proof` only: `kv/vproof-a/`, `kv/vproof-b/`, read of role `portal-secrets`, lookup/revoke of itself; TTL = max TTL = 1 hour, no renew-self, usable only from 127.0.0.1 inside `vault-0`) is checked to carry exactly that policy and revoked by the cleanup. No root token, no `generate-root`, no policy is written or deleted. The default PROOF_* timeouts fit in the hour; the script warns if yours do not.
 - TeamNamespaces `vproof-a` and `vproof-b` (label `idp.ithaca-idp.com/vault-proof=true`, owner `verify@example.com`), the namespaces and objects the operator creates for them, VaultStaticSecrets and the Secrets VSO writes in them, and `kv/vproof-a/hello`, `kv/vproof-b/hello` (random values).
 - P7 (only if role `portal-secrets` exists): a 10-minute ServiceAccount token for `idp-system/portal-api` (audience `vault`), a Vault login with it, one key `kv/vproof-a/p7-<random>` (deleted right away) and write attempts to `kv/vault-demo/` and `kv/idp-system/` that must be denied (removed again, or listed for you, if they were not).
+- P8 (only if role `workload-reader` exists; `PROOF_P8=off` skips it): ServiceAccount `vproof-a/wlproof` (no WorkloadIdentity CR needed: the role only checks the token and the namespace label `app.kubernetes.io/managed-by=idp-operator`), a 10-minute token for it (audience `vault`), keys `kv/vproof-a/wlproof/x`, `kv/vproof-a/other/x`, `kv/vproof-b/wlproof/x` (random value, deleted again), and a 10-minute token for `vault/vault-proof` whose login must be refused (namespace `vault` is not labelled). Asserted: the own key is readable (value compared by sha256), the other name, the other namespace's same name and LIST of `kv/metadata/vproof-a/` are `403 permission denied`, and the login from `vault` fails with `namespace not authorized`. Any other error text (transport, expired token, wrong audience) fails P8 as inconclusive instead of passing it.
 - It refuses to start if `vproof-a` or `vproof-b` already exists (only `--cleanup` removes ones carrying its label; anything else is never touched) or if ServiceAccount `vault/vault-proof` is missing.
 
 Secrets (ServiceAccount JWTs, proof and portal Vault tokens, test values) only live in 0600 files in a private temp dir and in pipes, never in argv, env or output; values are compared by sha256.
@@ -114,7 +115,15 @@ Expected output (abridged):
     list kv/metadata/vproof-a/: denied (want denied)
     PASS  P7 role portal-secrets is write-only: ...
     (or: SKIP  P7 role portal-secrets does not exist yet ...)
-==> 8. purge
+==> 8. P8: Vault role workload-reader (WorkloadIdentity): ...
+    read kv/data/vproof-a/wlproof/x: allowed (want allowed)
+    read kv/data/vproof-a/other/x: denied (want denied)
+    read kv/data/vproof-b/wlproof/x: denied (want denied)
+    list kv/metadata/vproof-a/: denied (want denied)
+    login as vault/vault-proof: refused, namespace not authorized (want refused)
+    PASS  P8 role workload-reader: ...
+    (or: SKIP  P8 role workload-reader does not exist yet ... / disabled)
+==> 9. purge
     PASS  P5 deleting vproof-a purged kv/vproof-a/ and left kv/vproof-b/hello intact
     PASS  P6 deleting vproof-b purged kv/vproof-b/; kv/vproof-a/ and kv/vproof-b/ are both gone
 ==> cleanup
@@ -139,6 +148,8 @@ The metadata checks of P7 (read/list on `kv/metadata/<ns>/` denied) expect the t
 | `P3`/`P4` ISOLATION BROKEN | **Security bug**: a namespace read another namespace's secret. Check the `ns-reader` policy template and the role's bound namespaces before anything else. |
 | `P3`/`P4` inconclusive | The Secret stayed absent, but there is no evidence that Vault denied it: no Warning event, a Warning without 403/permission denied (VSO not reconciled, Vault unreachable), or the positive proof in the same namespace failed. Not a proof either way. |
 | `P7 ... not write-only as designed; <op> <path> is allowed` | **Security bug** in policy `portal-secrets` (`is error` means the attempt failed for another reason, see `kubectl -n vault logs vault-0`). |
+| `P8 ... does not isolate as designed; <op> <path> is allowed` / `logged in ... not managed by the operator` | **Security bug** in policy or role `workload-reader` (`is error` or `inconclusive` means the attempt failed for another reason, see `kubectl -n vault logs vault-0`). |
+| `P8 role workload-reader does not exist yet` (SKIP) | The Vault predates the role; rebuild (`make down` / `make up`). |
 | `P7 could not get a token` / `log in` | No ServiceAccount `idp-system/portal-api`, no right to create its token, or role `portal-secrets` bound differently. |
 | `P5`/`P6` not removed | The operator's purge finalizer is stuck (`VaultPurgePending`, `idp-operator-purge` login or policy). |
 | `P5`/`P6` `kv/<ns>/ is present` | The purge did not delete the data; `kv/vproof-b/ changed` means it deleted too much. `is error` usually means the admin token stopped working. |
