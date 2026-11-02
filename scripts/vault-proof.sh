@@ -21,9 +21,13 @@
 #   6. P3/P4: a VaultStaticSecret pointing at the other namespace's path never syncs and VSO
 #      reports that Vault denied it (403 / permission denied).
 #   7. P7: the portal's Vault role portal-secrets is write-only (skipped if the role does not exist).
-#   8. P5/P6: deleting a TeamNamespace purges its kv/<ns>/ and leaves the other one intact.
+#   8. P8: the Vault role workload-reader (WorkloadIdentity, Order #03) lets a ServiceAccount of
+#      any name, in a namespace labelled app.kubernetes.io/managed-by=idp-operator, read only
+#      kv/<its namespace>/<its name>/*; a ServiceAccount in an unlabelled namespace cannot log in
+#      (skipped if the role does not exist, or with PROOF_P8=off).
+#   9. P5/P6: deleting a TeamNamespace purges its kv/<ns>/ and leaves the other one intact.
 #   A PASS/FAIL line per proof and a summary. Cleanup (TeamNamespaces, KV leftovers, the admin and
-#   portal Vault tokens via revoke-self, temp files) runs on every exit, also on failure or Ctrl-C.
+#   portal and workload Vault tokens via revoke-self, temp files) runs on every exit, also on failure or Ctrl-C.
 #
 # Usage: ./scripts/vault-proof.sh            run the proof
 #        ./scripts/vault-proof.sh --cleanup  remove leftovers of an interrupted run
@@ -31,7 +35,9 @@
 # Secrets (ServiceAccount JWTs, admin and portal Vault tokens, the test values) only live in 0600
 # files in a private temp dir and in pipes: never in argv (so not in `ps`), env, stdout, stderr or
 # logs. They reach vault-0 on `kubectl exec -i` STDIN only. Values are compared by sha256, never
-# printed. Bash 3.2 compatible (macOS).
+# printed.
+# Environment: PROOF_P8=off skips P8; PROOF_P7_METADATA=skip leaves the P7 metadata checks out;
+# PROOF_*_TIMEOUT / PROOF_DENY_WAIT / PROOF_POLL tune the waits. Bash 3.2 compatible (macOS).
 set -euo pipefail
 set +x # never trace: tokens pass through this script
 
@@ -52,7 +58,10 @@ SYNC_TIMEOUT="${PROOF_SYNC_TIMEOUT:-120}"     # positive proof: VSO syncs the ow
 DENY_WAIT="${PROOF_DENY_WAIT:-60}"            # negative proof: how long the foreign path must stay unsynced
 DELETE_TIMEOUT="${PROOF_DELETE_TIMEOUT:-300}" # per TeamNamespace deletion incl. the operator's Vault purge
 P7_METADATA="${PROOF_P7_METADATA:-denied}"    # denied: expect read/list on kv/metadata/<ns>/ denied for the portal; skip
+P8="${PROOF_P8:-on}"                          # on: run P8 (role workload-reader); off: skip it
 POLL="${PROOF_POLL:-5}"
+WL_ROLE="workload-reader"                     # Vault Kubernetes auth role and policy (idp-gitops workloads/vault/config-job.yaml)
+WL_SA="wlproof"                               # ServiceAccount created in NS_A for P8
 ME="./scripts/vault-proof.sh"
 REBUILD="the vault-config Job only configures a freshly initialized Vault, so a Vault from before role $PROOF_ROLE was added needs a rebuild (make down, make up)"
 
@@ -120,6 +129,7 @@ usage() {
   printf 'Usage: %s [--cleanup]\n' "$ME"
   printf '  (no flag)  prove per-namespace Vault access and isolation with the throwaway\n'
   printf '             TeamNamespaces %s and %s (created and removed again)\n' "$NS_A" "$NS_B"
+  printf '  PROOF_P8=off skips P8 (role %s)\n' "$WL_ROLE"
   printf '  --cleanup  remove leftovers of an interrupted run (only objects labelled %s=true)\n' "$MARK_KEY"
   printf 'See docs/vault.md, "Proving per-namespace isolation".\n'
 }
@@ -270,7 +280,7 @@ summary() {
 cleanup_interrupted() {
   trap '' INT TERM HUP
   local f
-  for f in "$tmp/admin-token" "$tmp/portal-token"; do
+  for f in "$tmp/admin-token" "$tmp/portal-token" "$tmp/wl-token"; do
     [ -s "$f" ] && vault_op "$f" revoke-self - >/dev/null 2>&1
   done
   if [ -n "$tmp" ] && [ -d "$tmp" ]; then
@@ -292,6 +302,10 @@ cleanup() {
     if [ -s "$tmp/portal-token" ]; then
       vault_op "$tmp/portal-token" revoke-self - >/dev/null 2>&1 && info "revoked the portal-secrets test token"
       rm -f "$tmp/portal-token"
+    fi
+    if [ -s "$tmp/wl-token" ]; then
+      vault_op "$tmp/wl-token" revoke-self - >/dev/null 2>&1 && info "revoked the $WL_ROLE test token"
+      rm -f "$tmp/wl-token"
     fi
     for n in "$NS_A" "$NS_B"; do
       if { [ "$n" = "$NS_A" ] && [ -n "$CREATED_A" ]; } || { [ "$n" = "$NS_B" ] && [ -n "$CREATED_B" ]; }; then
@@ -634,8 +648,127 @@ else
   fi
 fi
 
-# --- 8. purge proof -----------------------------------------------------------------------------
-step "8. purge: deleting a TeamNamespace removes its kv/<ns>/ only (waiting up to ${DELETE_TIMEOUT}s each)"
+# --- 8. workload-reader role ---------------------------------------------------------------------
+step "8. P8: Vault role $WL_ROLE (WorkloadIdentity): any ServiceAccount in a managed namespace, only its own kv/<ns>/<name>/"
+# The role does not need the WorkloadIdentity CR: Vault only looks at the ServiceAccount's token and
+# its namespace label, so P8 uses a plain ServiceAccount $WL_SA in $NS_A (a TeamNamespace, hence
+# labelled app.kubernetes.io/managed-by=idp-operator). Nothing here depends on the operator's
+# WorkloadIdentity controller.
+P8_BAD=""
+P8_GOT=""
+# p8_try <want: denied|allowed> <op> <path>: one attempt with the workload Vault token. A denial only
+# counts as `denied` if it exited with the vault CLI's error (not 10 = login failed) and its stderr
+# says 403 / permission denied; a transport or token problem is `error` and fails P8. The positive
+# read with the same token (checked first) rules out a broken token for the denials that follow.
+p8_try() {
+  local want="$1" op="$2" path="$3" rc
+  vault_op "$tmp/wl-token" "$op" "$path" >"$tmp/p8-out" 2>"$tmp/err" && rc=0 || rc=$?
+  if [ "$rc" = 0 ]; then
+    P8_GOT=allowed
+  elif [ "$rc" != 10 ] && denied_err; then
+    P8_GOT=denied
+  else
+    P8_GOT=error
+  fi
+  [ "$P8_GOT" = "$want" ] || P8_BAD="$P8_BAD; $op $path is $P8_GOT (want $want; $(first_err))"
+  info "$op $path: $P8_GOT (want $want)"
+}
+# p8_login <ns> <ServiceAccount> <token file>: a 10-minute JWT (audience vault) logs in with role
+# workload-reader; the Vault token lands in the 0600 file. Returns 0 (logged in), 1 (no JWT) or
+# 2 (login refused; the reason is in $tmp/err, the policies in P8_POLICIES).
+p8_login() {
+  if ! kubectl -n "$1" create token "$2" --audience vault --duration 10m 2>"$tmp/err" | tr -d '\n' >"$tmp/p8-jwt" \
+    || [ ! -s "$tmp/p8-jwt" ]; then
+    rm -f "$tmp/p8-jwt"
+    return 1
+  fi
+  vexec_in sh -c "$VAULT_K8S_LOGIN_IN_POD" sh "$WL_ROLE" <"$tmp/p8-jwt" >"$tmp/p8-login.json" 2>"$tmp/err" || true
+  rm -f "$tmp/p8-jwt"
+  jq -j '.auth.client_token // ""' "$tmp/p8-login.json" >"$3" 2>/dev/null || true
+  P8_POLICIES="$(jq -r '(.auth.token_policies // .auth.policies // []) | join(",")' "$tmp/p8-login.json" 2>/dev/null || true)"
+  rm -f "$tmp/p8-login.json"
+  if [ ! -s "$3" ]; then rm -f "$3"; return 2; fi
+  return 0
+}
+P8_POLICIES=""
+if [ "$P8" = off ]; then
+  pskip "P8 disabled (PROOF_P8=off)"
+elif [ "$(kubectl get namespace "$NS_A" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)" != idp-operator ]; then
+  pfail "P8 inconclusive: namespace $NS_A does not carry app.kubernetes.io/managed-by=idp-operator, so the positive login cannot be proven (kubectl get ns $NS_A --show-labels)"
+elif [ -n "$(kubectl get namespace "$VAULT_NS" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)" ]; then
+  pfail "P8 inconclusive: namespace $VAULT_NS carries a app.kubernetes.io/managed-by label, so it is not an 'unlabelled namespace' for the negative login (kubectl get ns $VAULT_NS --show-labels)"
+elif ! kubectl -n "$NS_A" create serviceaccount "$WL_SA" >/dev/null 2>"$tmp/err"; then
+  pfail "P8 could not create ServiceAccount $NS_A/$WL_SA: $(first_err)"
+else
+  p8_login "$NS_A" "$WL_SA" "$tmp/wl-token" && p8_rc=0 || p8_rc=$?
+  if [ "$p8_rc" = 1 ]; then
+    pfail "P8 could not get a token for ServiceAccount $NS_A/$WL_SA (audience vault): $(first_err)"
+  elif [ "$p8_rc" = 2 ] && grep -qi 'invalid role name' "$tmp/err" 2>/dev/null; then
+    pskip "P8 role $WL_ROLE does not exist yet (idp-gitops WorkloadIdentity change not applied to Vault): $REBUILD"
+  elif [ "$p8_rc" = 2 ]; then
+    pfail "P8 could not log in to Vault with role $WL_ROLE as $NS_A/$WL_SA: $(first_err)"
+  elif [ "$P8_POLICIES" != "$WL_ROLE" ]; then
+    vault_op "$tmp/wl-token" revoke-self - >/dev/null 2>&1 || true
+    rm -f "$tmp/wl-token"
+    pfail "P8 role $WL_ROLE issued a token with policies '$P8_POLICIES', expected only '$WL_ROLE'"
+  else
+    # Three keys with the admin token: the own path, the same namespace under another name, the
+    # same name in the other namespace. One random value, never shown, compared by sha256.
+    od -An -N16 -tx1 /dev/urandom | tr -d ' \n' >"$tmp/value"
+    h8="$(sha256 <"$tmp/value")"
+    printf '{"data":{"message":"%s"}}' "$(<"$tmp/value")" >"$tmp/p8-body"
+    rm -f "$tmp/value"
+    p8_seed=1
+    for k in "$NS_A/$WL_SA/x" "$NS_A/other/x" "$NS_B/$WL_SA/x"; do
+      kv_left_add "$k"
+      vault_op "$tmp/admin-token" write "kv/data/$k" "$tmp/p8-body" >/dev/null 2>"$tmp/err" \
+        || { p8_seed=""; P8_BAD="$P8_BAD; could not write kv/$k with the admin token: $(first_err)"; }
+    done
+    rm -f "$tmp/p8-body"
+    if [ -n "$p8_seed" ]; then
+      # (a) the positive read, with the value checked: login and token both work.
+      p8_try allowed read "kv/data/$NS_A/$WL_SA/x"
+      if [ "$P8_GOT" = allowed ] && [ "$(jq -j '.data.data.message // ""' "$tmp/p8-out" 2>/dev/null | sha256)" != "$h8" ]; then
+        P8_BAD="$P8_BAD; read kv/data/$NS_A/$WL_SA/x returned another value"
+      fi
+      if [ "$P8_GOT" = allowed ]; then
+        # (b) own namespace, another name; (c) same name, other namespace; LIST of the namespace.
+        p8_try denied read "kv/data/$NS_A/other/x"
+        p8_try denied read "kv/data/$NS_B/$WL_SA/x"
+        p8_try denied list "kv/metadata/$NS_A/"
+      fi
+    fi
+    rm -f "$tmp/p8-out"
+    # (d) negative login: ServiceAccount vault/vault-proof (namespace vault: not labelled) is
+    # refused. The refusal must be Vault's "namespace not authorized"; a missing token, a bad
+    # audience or a transport error says something else and fails P8 instead of passing it.
+    p8_login "$VAULT_NS" "$PROOF_SA" "$tmp/wl-token-neg" && p8_rc=0 || p8_rc=$?
+    if [ "$p8_rc" = 0 ]; then
+      vault_op "$tmp/wl-token-neg" revoke-self - >/dev/null 2>&1 || true
+      rm -f "$tmp/wl-token-neg"
+      P8_BAD="$P8_BAD; $VAULT_NS/$PROOF_SA logged in with role $WL_ROLE although namespace $VAULT_NS is not managed by the operator"
+    elif [ "$p8_rc" = 1 ]; then
+      P8_BAD="$P8_BAD; negative login inconclusive: no token for $VAULT_NS/$PROOF_SA ($(first_err))"
+    elif grep -qi 'namespace not authorized' "$tmp/err" 2>/dev/null; then
+      info "login as $VAULT_NS/$PROOF_SA: refused, namespace not authorized (want refused)"
+    else
+      P8_BAD="$P8_BAD; negative login inconclusive: refused, but not with 'namespace not authorized' ($(first_err))"
+    fi
+    vault_op "$tmp/wl-token" revoke-self - >/dev/null 2>&1 || true
+    rm -f "$tmp/wl-token"
+    for k in "$NS_A/$WL_SA/x" "$NS_A/other/x" "$NS_B/$WL_SA/x"; do
+      vault_op "$tmp/admin-token" delete "kv/metadata/$k" >/dev/null 2>&1 && kv_left_del "$k"
+    done
+    if [ -z "$P8_BAD" ]; then
+      ppass "P8 role $WL_ROLE: $NS_A/$WL_SA reads kv/$NS_A/$WL_SA/x only (kv/$NS_A/other/x, kv/$NS_B/$WL_SA/x and LIST kv/metadata/$NS_A/ denied); $VAULT_NS/$PROOF_SA (unlabelled namespace) cannot log in"
+    else
+      pfail "P8 role $WL_ROLE does not isolate as designed${P8_BAD}"
+    fi
+  fi
+fi
+
+# --- 9. purge proof -----------------------------------------------------------------------------
+step "9. purge: deleting a TeamNamespace removes its kv/<ns>/ only (waiting up to ${DELETE_TIMEOUT}s each)"
 if delete_if_ours "$NS_A"; then
   CREATED_A=""
   sa="$(kv_state "$NS_A")"
