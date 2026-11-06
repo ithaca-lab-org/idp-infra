@@ -202,3 +202,23 @@ resource "google_service_account_iam_member" "portal_image_push_wif" {
   role               = "roles/iam.workloadIdentityUser"
   member             = "${local.wif_pool_root}/attribute.repo_id_workflow/${var.portal_repo_id}@${local.portal_repo_full}/${var.image_push_workflow}@${var.image_push_ref}"
 }
+
+# --- Tenant bucket broker role (ADR 0010) ------------------------------------
+# Custom role for the in-cluster resource broker (GSA idp-broker@, created in envs/persistent by
+# modules/tenant-resources). It lives here, human-applied, because the CI apply identity has
+# projectIamAdmin but not roles/iam.roleAdmin on purpose: CI can bind this role but never mint
+# or widen roles. Bucket permissions only; no storage.objects.*. See docs/tenant-resources.md.
+
+resource "google_project_iam_custom_role" "idp_broker_buckets" {
+  role_id     = var.broker_role_id
+  title       = "IDP resource broker: tenant buckets"
+  description = "Create, manage and set IAM on Cloud Storage buckets. No object access. Bound with a condition to idp-* buckets (ADR 0010)."
+  stage       = "GA"
+  permissions = var.broker_role_permissions
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  depends_on = [google_project_service.apis]
+}

@@ -22,3 +22,8 @@ output "portal_image_push_service_account" {
   description = "Set as the GCP_PUSH_SA variable on the portal repository."
   value       = google_service_account.portal_image_push.email
 }
+
+output "idp_broker_buckets_role_id" {
+  description = "Custom role for the tenant bucket broker (projects/<project>/roles/<id>); bound by modules/tenant-resources."
+  value       = google_project_iam_custom_role.idp_broker_buckets.id
+}

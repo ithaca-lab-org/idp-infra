@@ -72,3 +72,8 @@ output "vault_sa" {
   description = "Google service account for the vault/vault KSA annotation."
   value       = module.vault_unseal.service_account_email
 }
+
+output "idp_broker_sa" {
+  description = "Google service account for the idp-system/idp-broker KSA annotation."
+  value       = module.tenant_resources.service_account_email
+}
