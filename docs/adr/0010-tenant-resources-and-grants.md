@@ -29,7 +29,7 @@ Direct principal bindings (no per-workload GSA), requested through a fixed menu,
 ## Consequences
 
 - Tenants never edit IAM and never get a key. A grant is one reviewed shape: a menu role on one owned resource for one workload.
-- A compromised broker can widen or revoke access to tenant buckets (or delete empty ones) but cannot reach platform buckets, secrets, KMS or project IAM, while the IAM conditions hold (spike finding 2).
+- **What a compromised broker can and cannot do (IAM review, 2026-11-06).** It cannot reach platform buckets, secrets, KMS or project IAM, and it can only grant the two menu roles. But the IAM condition limits ROLES, not MEMBERS and not bucket settings: it could grant a menu role on an `idp-*` bucket to an outside account, switch public access prevention or uniform access off with `storage.buckets.update` and make a bucket public, lock a retention policy (undeletable bucket) or create costly buckets. No condition attribute restricts members, so the closing control is project-level organisation policy set by a human BEFORE the feature is enabled: `storage.publicAccessPrevention` and `storage.uniformBucketLevelAccess` enforced, plus a member allow-list (the exact constraint that accepts `principal://...svc.id.goog` members must be tested first). The runbook is `docs/tenant-resources.md` ("Guardrails a human must set before RESOURCES_ENABLED"); until then this is an accepted lab risk and the portal flag stays off.
 - Cloud Audit Logs show which principal (`ns/<ns>/sa/<name>`) called the API.
 - Isolation inside one namespace is as in ADR 0009: a tenant admin can create more ServiceAccounts, but a grant names one ServiceAccount, so another workload does not inherit it. Anyone able to run a pod as that ServiceAccount does use it.
 - Some Google APIs do not accept direct principal identities. Cloud Storage and Pub/Sub are fine to start; each new resource type must be checked against the list of supported APIs, and a type that is not supported needs a GSA (option: a pre-created GSA bound by Terraform).
@@ -54,7 +54,7 @@ Rough sizes are for one person with agents doing the first drafts; every IAM or 
 | # | Work | Repo | Size |
 |---|---|---|---|
 | 0 | Spike: DONE 2026-11-05 (idp-infra #44, findings above) | idp-infra | done |
-| 1 | Terraform module `tenant-resources` in `envs/persistent` (CI applied): `idp-broker@`, conditioned grants for create/IAM on `idp-*` buckets, the `workloadIdentityUser` binding for `idp-system/idp-broker`, Storage API enabled, labels; Opus review | idp-infra | M |
+| 1 | Terraform module `tenant-resources` in `envs/persistent` (CI applied; the custom role lives in `bootstrap/`, human-applied first): `idp-broker@`, conditioned grants for create/IAM on `idp-*` buckets, the `workloadIdentityUser` binding for `idp-system/idp-broker`, Storage API enabled, labels; Opus review | idp-infra | M |
 | 2 | CRDs `BucketClaim`, `ResourceGrant`; broker controllers behind a Go interface for the Storage/IAM calls (fake in tests); finalizers and the purge of bindings; admission policy `idp-broker-scope` (names, menu, ownership label, no foreign writes) with envtests | idp-portal | L |
 | 3 | Portal API and UI: Resources page, grant form on the workload page, flag `RESOURCES_ENABLED`, caps, rate limit, tests; portal-scope policy for the two kinds | idp-portal | M |
 | 4 | Deploy: broker Deployment, ServiceAccount with the GSA annotation, RBAC, NetworkPolicy and egress to Google APIs, flag, image pins | idp-gitops | S |
