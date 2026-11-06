@@ -137,3 +137,27 @@ variable "registry_repository_id" {
   type        = string
   default     = "idp"
 }
+
+variable "broker_role_id" {
+  description = "Role ID of the custom role for the tenant bucket broker (ADR 0010). envs/persistent binds projects/<project>/roles/<this>."
+  type        = string
+  default     = "idpBrokerBuckets"
+}
+
+variable "broker_role_permissions" {
+  description = "Permissions of the broker custom role: bucket lifecycle and bucket IAM only, never object access."
+  type        = list(string)
+  default = [
+    "storage.buckets.create",
+    "storage.buckets.get",
+    "storage.buckets.update",
+    "storage.buckets.delete",
+    "storage.buckets.getIamPolicy",
+    "storage.buckets.setIamPolicy",
+  ]
+
+  validation {
+    condition     = alltrue([for p in var.broker_role_permissions : startswith(p, "storage.buckets.")])
+    error_message = "The broker role may only hold storage.buckets.* permissions (no objects, no project-level permissions)."
+  }
+}

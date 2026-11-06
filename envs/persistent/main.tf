@@ -61,3 +61,15 @@ module "vault_unseal" {
   project_id  = var.project_id
   key_ring_id = module.kms.key_ring_id
 }
+
+# Identity of the tenant resource broker (ADR 0010, docs/tenant-resources.md): GSA idp-broker,
+# Workload Identity for idp-system/idp-broker, one conditioned grant of a custom role.
+# ORDER: the custom role idpBrokerBuckets is created in bootstrap/ (human-applied; CI cannot
+# create roles). Apply bootstrap BEFORE merging this. The PR plan does NOT catch a missing role;
+# the APPLY on main does (SA and WI binding get created, the project binding fails, and every later
+# persistent apply stays red). Gate: `gcloud iam roles describe idpBrokerBuckets --project <project>` must succeed.
+module "tenant_resources" {
+  source = "../../modules/tenant-resources"
+
+  project_id = var.project_id
+}
