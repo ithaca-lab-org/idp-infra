@@ -95,7 +95,23 @@ gcloud org-policies set-policy /tmp/ubla.yaml
 
 The same commands are in [`scripts/set-tenant-org-policies.sh`](../scripts/set-tenant-org-policies.sh). Run `./scripts/set-tenant-org-policies.sh [project-id]`. It asks for the project ID (or takes it as the first argument or `PROJECT_ID`), shows it and asks you to type `yes`, then runs each `gcloud` command in turn, prints a `[ OK ]` line after each one that succeeded, waits 2 seconds before the next, and stops at the first failure. It only covers the two enforced constraints; the member allow-list below needs a decision first and is not scripted. You need `roles/orgpolicy.policyAdmin` (see below). If the first `set-policy` fails right after the API was enabled, wait a minute and run it again: the commands are idempotent. Nothing here has been run.
 
-Member allow-list: use `constraints/iam.allowedPolicyMemberDomains` (customer ID `<directory-customer-id>`) or the managed constraint `iam.managed.allowedPolicyMembers`, which can allow the project's Workload Identity pool principals (`<project-id>.svc.id.goog`) plus your own identity. **Verify which works with `principal://...svc.id.goog` members before enforcing:** the domain constraint may reject principal identities. Start with a dry-run policy where available, and keep a break-glass path (policy admin role for you, not CI). The caller needs `roles/orgpolicy.policyAdmin` on the project or its organization (`<org-id>`); CI has no such role.
+**Status (2026-11-08):** `storage.publicAccessPrevention` and `storage.uniformBucketLevelAccess` are ENFORCED on the project (set with `scripts/set-tenant-org-policies.sh`, confirmed with `gcloud org-policies describe <constraint> --project=<project> --effective`). That closes the public-bucket path and the ACL bypass of the role limit. The member allow-list is NOT set (see below).
+
+Permissions: project Owner is not enough to set org policies (`orgpolicy.policies.create` is denied). An organisation admin must grant `roles/orgpolicy.policyAdmin` first. It was granted on the ORGANISATION to the owner account, so remove it there when done: `gcloud organizations remove-iam-policy-binding <org-id> --member=user:<account> --role=roles/orgpolicy.policyAdmin` (the `projects` form says "binding not found" when it was granted on the organisation).
+
+Member allow-list (not set, decision pending): both constraints exist on the project and are unset (`iam.allowedPolicyMemberDomains` allowAll, `iam.managed.allowedPolicyMembers` enforce false). The managed constraint is configured like this (from Google's documentation; it shows no example for Workload Identity pool principals, so which `allowedPrincipalSets` value matches `principal://...svc.id.goog` members is unproven):
+
+```yaml
+name: projects/<project-number>/policies/iam.managed.allowedPolicyMembers
+spec:
+  rules:
+  - enforce: true
+    parameters:
+      allowedMemberSubjects: [user:<owner-account>]
+      allowedPrincipalSets: [<workload identity pool and the project's service accounts: to be determined>]
+```
+
+Why it is not enforced now: Google warns that restricting members can stop Google-managed service agents and our own service accounts (the Terraform apply and plan accounts, the node, Vault and portal service accounts, the pool itself) from being granted roles, so an unrelated IAM change could start failing. Do it in two steps if wanted: first a policy with `dryRunSpec` instead of `spec` (violations are logged, nothing is blocked), grant a test `principal://` member on a test bucket and look for a logged violation, list every principal the platform legitimately uses until the dry run is quiet, and only then enforce. The residual risk without it: a compromised broker could grant `objectViewer` or `objectUser` on an `idp-*` bucket to an outside account (it cannot make a bucket public). It stays an accepted risk for a single-user lab until the dry run is done.
 
 Verify afterwards: create a test bucket `idp-guardrail-test`, bind `roles/storage.objectUser` for a test `principal://iam.googleapis.com/projects/<project-number>/locations/global/workloadIdentityPools/<project-id>.svc.id.goog/subject/ns/<ns>/sa/<ksa>`, confirm a pod of that ServiceAccount can read and write, that granting to `allUsers` or an outside `user:` is rejected, and that disabling public access prevention is rejected. Delete the test bucket and binding.
 
