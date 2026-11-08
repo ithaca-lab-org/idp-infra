@@ -1,10 +1,10 @@
 SHELL := /bin/bash
 ENV   ?= envs/dev
 
-.PHONY: help fmt check plan up down verify tailscale-cleanup
+.PHONY: help fmt check plan up down verify tailscale-cleanup tenant-resources-cleanup
 
 help:
-	@grep -E '^[a-z]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*##/ -/'
+	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*##/ -/'
 
 fmt: ## format all Terraform
 	terraform fmt -recursive
@@ -35,9 +35,13 @@ up: ## build the destroyable platform (human only)
 down: ## tear down network + GKE and deregister the cluster's Tailscale devices (human only)
 	terraform -chdir=$(ENV) destroy
 	@./scripts/tailscale-cleanup.sh --delete --include-online || echo "tailscale-cleanup failed: delete the stale devices by hand (docs/tailscale.md)"
+	@./scripts/tenant-resources-cleanup.sh --delete --assume-cluster-gone || echo "tenant-resources-cleanup failed: remove the stale buckets and bindings by hand (docs/tenant-resources.md, Cleanup after make down)"
 
 tailscale-cleanup: ## list stale cluster devices in the tailnet (DELETE=1 removes them)
 	./scripts/tailscale-cleanup.sh $(if $(DELETE),--delete,)
+
+tenant-resources-cleanup: ## list stale tenant buckets and bindings (DELETE=1 removes them; asks the cluster)
+	./scripts/tenant-resources-cleanup.sh $(if $(DELETE),--delete,)
 
 verify: ## post-build checks
 	./scripts/verify.sh

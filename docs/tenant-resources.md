@@ -118,3 +118,43 @@ Verify afterwards: create a test bucket `idp-guardrail-test`, bind `roles/storag
 ### Accepted risk until then
 
 Until the org policies are set (and while `orgpolicy.googleapis.com` is not enabled), the broker can do (a) to (d) above to `idp-*` buckets. Also accepted: a retention lock can make a bucket undeletable until its retention expires, and bucket count is limited only by the portal caps and the budget alert. Keep `RESOURCES_ENABLED` off until the guardrails are in place, or accept this for a single-user lab explicitly.
+
+## Proof
+
+`scripts/resource-proof.sh` proves ADR 0010 against the real broker and the real Google APIs. Run it by hand from a laptop (it is not part of `make up` or CI) with `gcloud` (project set; allowed to read the project, buckets and org policies, and to create and delete buckets), `kubectl` (cluster admin on the idp cluster) and `jq`.
+
+```bash
+PROOF_DRY_RUN=1 ./scripts/resource-proof.sh      # prints the plan, creates nothing
+./scripts/resource-proof.sh                      # asks you to type yes (PROOF_YES=1 skips)
+PROOF_BROKER_LIMITS=off ./scripts/resource-proof.sh   # skip step 7 (no impersonation)
+```
+
+Needs: `BROKER_ENABLED=true` on `idp-system/idp-broker` (it ships disabled; flip it in `idp-gitops` `workloads/idp-operator/idp-broker.yaml`), the Terraform in this page applied (role `idpBrokerBuckets`, the conditional binding), and the guardrails above (`storage.publicAccessPrevention` and `storage.uniformBucketLevelAccess` effectively enforced). The preflight fails with a pointer here if one is missing, and refuses to run when `rproof-a`, `rproof-b` or a bucket `idp-rproof-*` is left over.
+
+What it creates: TeamNamespaces `rproof-a` and `rproof-b`, WorkloadIdentities `wl-a`, `wl-other` (a) and `wl-b` (b), BucketClaims `data` and `empty`, ResourceGrants `wl-a-data` and `wl-other-data`, short-lived `curlimages/curl` pods, buckets `idp-rproof-a-data-<hash>` and `idp-rproof-a-empty-<hash>`, and, with limits on and only if impersonation fails, `roles/iam.serviceAccountTokenCreator` for you on `idp-broker@` (removed at the end). Everything is removed by an EXIT trap; buckets only when name, owner label and claim UID all belong to this run.
+
+Steps (`PASS`/`FAIL` each): 1 preflight; 2 namespaces and workload identities; 3 bucket name, labels, public access prevention, uniform access, location; 4 the grant adds exactly one binding; 5 `wl-a` writes and reads (200), `wl-other` and `wl-b` get 403; 6 reader reads (200) and cannot write (403), revoke gives 403 and removes the binding; 7 broker limits as `idp-broker@`: objectViewer allowed, `storage.admin` denied, removal allowed, `allUsers` denied, outside member observed only (it uses your own account, a project member, so it cannot detect a domain allow-list; expected allowed: the accepted risk), non-`idp-` bucket denied, state bucket denied; 8 deleting a claim with an object orphans the bucket (`idp-orphaned=true`, no principal binding left), an empty claim's bucket is deleted and a re-created claim is Ready. Expected summary: every line `PASS`, `OBS` lines for step 7, final `RESULT: all proofs passed`; exit code non-zero on any FAIL. Unproven until the first run: 7b, 7c (removal under the custom role), 8b to 8d, and the `gcloud` JSON field names it reads.
+
+Duration: about 15 to 30 minutes (IAM propagation can take minutes, conditional bindings about 90 s, namespace deletion up to `PROOF_DELETE_TIMEOUT`). Timeouts: `PROOF_READY_TIMEOUT` (180), `PROOF_PROP_TIMEOUT` (300), `PROOF_COND_TIMEOUT` (300), `PROOF_DENY_TIMEOUT` (60), `PROOF_DELETE_TIMEOUT` (300).
+
+If a run is killed, clean by hand (the next run refuses until this is done):
+
+```bash
+kubectl delete teamnamespace rproof-a rproof-b            # the broker then releases the claims
+gcloud storage buckets list --filter='name~^idp-rproof-' --format='value(name)'
+gcloud storage rm --recursive gs://<bucket>               # only buckets listed above
+gcloud iam service-accounts get-iam-policy idp-broker@<project>.iam.gserviceaccount.com   # a leftover tokenCreator for you
+gcloud iam service-accounts remove-iam-policy-binding idp-broker@<project>.iam.gserviceaccount.com \
+  --member=user:<you> --role=roles/iam.serviceAccountTokenCreator
+```
+
+## Cleanup after make down
+
+`make down` destroys the cluster but not buckets or bucket IAM. `scripts/tenant-resources-cleanup.sh` handles that; `make down` runs it with `--delete --assume-cluster-gone` after the destroy, and `make tenant-resources-cleanup` (`DELETE=1` to act) runs it by hand.
+
+- Dry run by default; `--delete` acts. It lists buckets labelled `idp-managed=true` (name `idp-*`, this project's number, all in the same listing row).
+- It acts only when it knows which TeamNamespaces exist: `kubectl get teamnamespaces` answered, or `--assume-cluster-gone` was given. **An unreachable cluster is not a gone cluster:** without the flag an unreachable cluster means do nothing. The flag trusts you, so never use it while a cluster exists (the script refuses if `gcloud container clusters describe` still finds the cluster).
+- Namespace gone and bucket empty: deleted. Not empty: reported as `ORPHAN` with the object count, never deleted (you decide: `gcloud storage rm --recursive gs://<bucket>`).
+- Bindings for `principal://.../ns/<ns>/sa/<x>` of this project's pool for a namespace that no longer exists are removed in one read-modify-write per bucket (kept orphans included); all other bindings stay as they were.
+- Skips buckets with `idp-releasing=true` updated in the last 10 minutes; refuses more than 50 actions per run. A dry run exits 0.
+- Safety checks: without `--assume-cluster-gone` it needs the idp cluster context (`gke_<project>_<zone>_<cluster>`) and refuses to act when the cluster shows 0 TeamNamespaces while idp-managed buckets exist (a fresh or wrong cluster). With the flag it proceeds only when `gcloud container clusters describe` answers NOT_FOUND; any other error (auth, network, wrong zone) stops it with nothing changed. Buckets younger than 10 minutes are skipped as too new.
