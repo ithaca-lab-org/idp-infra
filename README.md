@@ -8,7 +8,7 @@ Terraform for the ithaca Internal Developer Platform on GKE (Standard, zonal, Sp
 | `modules/` | `network`, `gke`, `kms`, `registry`, `dns`, `budget`, `argocd`, `cert-manager-dns`, `ingress`, `order-events`, `vault-unseal`, `tenant-resources` |
 | `envs/persistent/` | Survives `make down`: KMS, registry, DNS, ingress IP, budget, order events, Vault unseal key, the resource broker's service account. **Applied by CI** on merge to `main` (ADR 0004) |
 | `envs/dev/` | The destroyable platform (network, GKE, Argo CD). **Human only**: `make up` / `make down` |
-| `scripts/` | `verify.sh` (post-build checks), `vault-proof.sh` and `resource-proof.sh` (proofs against the real cluster and project), cleanup scripts (`tailscale-cleanup.sh`, `tenant-resources-cleanup.sh`), `bootstrap-secrets.sh`, `set-tenant-org-policies.sh`, `precheck.sh`, spikes |
+| `scripts/` | `verify.sh` (post-build checks), `vault-proof.sh` and `resource-proof.sh` (proofs against the real cluster and project), cleanup scripts (`tailscale-cleanup.sh`, `tenant-resources-cleanup.sh`, `pv-disk-cleanup.sh`), `bootstrap-secrets.sh`, `set-tenant-org-policies.sh`, `precheck.sh`, spikes |
 | `docs/` | Operator docs (`vault.md`, `identity.md`, `tailscale.md`, `order-events.md`, `tenant-resources.md`) and `docs/adr/` (decisions 0001 to 0010) |
 
 ## CI
