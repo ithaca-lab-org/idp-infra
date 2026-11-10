@@ -44,8 +44,8 @@ tailscale-cleanup: ## list stale cluster devices in the tailnet (DELETE=1 remove
 tenant-resources-cleanup: ## list stale tenant buckets and bindings (DELETE=1 removes them; asks the cluster)
 	./scripts/tenant-resources-cleanup.sh $(if $(DELETE),--delete,)
 
-pv-disk-cleanup: ## list PVC disks left behind by a destroyed cluster (DELETE=1 removes the orphans)
-	./scripts/pv-disk-cleanup.sh $(if $(DELETE),--delete,)
+pv-disk-cleanup: ## list PVC disks left behind by a destroyed cluster (DELETE=1 removes the orphans; MAX=n raises the cap of 20)
+	./scripts/pv-disk-cleanup.sh $(if $(DELETE),--delete,) $(if $(MAX),--max-deletes $(MAX),)
 
 verify: ## post-build checks
 	./scripts/verify.sh

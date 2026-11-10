@@ -4,6 +4,8 @@
 #
 # Usage: ./scripts/pv-disk-cleanup.sh              report only (this is what `make down` runs)
 #        ./scripts/pv-disk-cleanup.sh --delete     deletes the disks listed as ORPHAN
+#        --max-deletes N    raise (or lower) the per-run cap of 20 (a whole backlog from many rebuilds can exceed it;
+#                           read the report first). Needs a positive integer.
 #
 # A disk is an ORPHAN only if ALL of these hold:
 #   - name starts with "pvc-" and its description carries GKE's marker kubernetes.io/created-for/pvc/name
@@ -12,7 +14,8 @@
 #   - the GKE cluster ($CLUSTER in $ZONE) is gone: `gcloud container clusters describe` answers NOT_FOUND.
 #     While the cluster exists, or when the answer is anything else (auth, network), the script only reports.
 # The report names the claim and namespace each disk was created for, so a human can tell the spinnaker spike's
-# MySQL disk from anything else. Hard cap: more than 20 disks to delete in one run is refused ("something is off").
+# MySQL disk from anything else. Hard cap: more than 20 disks to delete in one run is refused ("something is off")
+# unless --max-deletes says otherwise.
 # Deleting a disk destroys its data; every PV on this platform is rebuilt by `make up`, but read the report first.
 # Exit 0 for a report and a clean run; 1 if a delete failed. Bash 3.2 compatible. Needs gcloud and jq.
 set -euo pipefail
@@ -26,9 +29,17 @@ MAX_DELETES=20
 die() { printf 'pv-disk-cleanup: %s\n' "$*" >&2; exit 1; }
 
 mode="report"
-for arg in "$@"; do
+while [ $# -gt 0 ]; do
+  arg="$1"
+  shift
   case "$arg" in
     --delete) mode="delete" ;;
+    --max-deletes)
+      [ $# -gt 0 ] || die "--max-deletes needs a number"
+      case "$1" in '' | *[!0-9]* | 0) die "--max-deletes needs a positive integer, got '$1'" ;; esac
+      MAX_DELETES="$1"
+      shift
+      ;;
     -h | --help) sed -n '2,/^set -/p' "$0" | sed '$d'; exit 0 ;;
     *) die "unknown argument '$arg' (see --help)" ;;
   esac
