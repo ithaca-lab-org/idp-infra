@@ -20,3 +20,9 @@ Demo namespace `demo`, workload `orders`, hostname `orders.demo.apps.ithaca-idp.
 ## Not in this milestone
 
 `DeliveryPipeline` CRD, controller, portal page, deploy-request CR, per-user Deck access (deferred, ADR 0011), spike 3, mesh-identity pinning of the controller, image signing and Kyverno, golden-path GitHub workflow for tenants (Order #05).
+
+## Status (2026-11-14) and follow-ups recorded by the Opus reviews
+
+Merged: idp-gitops #53 (Spinnaker overlay and Tailscale ingress) and #54 (operator pin and flag), idp-portal #45 (route backend, deployer binding, reserved names, tenant Services policy) and #46 (Go 1.26.11 for GO-2026-6859), idp-infra #61 (tailscale-cleanup) and #62 (pipeline script). Still to do: the sample app repo (needs the user's OK to create it), then the first run (`docs/order-04-first-run.md`).
+
+Follow-ups, not done: (1) per-flow NetworkPolicies and egress control in the `spinnaker` namespace (today any Spinnaker pod can reach Clouddriver 7002, MySQL and Redis; a compromised Rosco running kustomize on tenant repos could abuse that); (2) make the `spinnaker-deployer` binding opt-in per TeamNamespace instead of global; (3) a startup check that ClusterRole `idp-spinnaker-deployer` exists when the flag is on, and pinning its content; (4) a dedicated AppProject for Spinnaker with a cluster-resource whitelist; (5) Tailscale ACL tag and grant for the admin-only audience of `spinnaker-admin`; (6) the Clouddriver restart per new namespace (spike 3: one account without a namespace list); (7) mesh-identity pinning of the controller; (8) the MySQL upstream test password; (9) `deployments/scale` was added to the ClusterRole but Deck actions beyond viewing are untested.
