@@ -1,0 +1,22 @@
+# Order #04 milestone 1: a first app, from code to a running pod (plan, 2026-11-14)
+
+Goal (user, 2026-11-14): a small application that a developer can deploy through a hand-made Spinnaker pipeline into the cluster, that reads a secret created on the portal Secrets page, that answers over HTTPS at its workload hostname, and whose pipeline and infrastructure are visible in the Spinnaker UI. Design and decisions: ADR 0011. The `DeliveryPipeline` CRD, controller and portal page are NOT part of this milestone (milestone 2).
+
+Accepted shortcuts for this milestone (each is hardening for later, not a blocker): Spinnaker account with an explicit namespace list for the demo namespace (spike 3, one account with a ClusterRole, is skipped), Gate protected by a label-based NetworkPolicy, no signing or Kyverno, image by digest from a public GHCR repo instead of Artifact Registry (no new bootstrap IAM), pipeline created by hand through the Gate API.
+
+## Pieces (separate PRs; Opus reviews 1 and 2 because they touch RBAC and networking)
+
+1. **idp-gitops: promote the Spinnaker overlay into `apps/`** (`platform/spinnaker/` from `spikes/spinnaker`, `apps/spinnaker.yaml`, wave 13). Cluster-admin for Clouddriver removed; the Kubernetes account `demo` limited to the demo namespace; Gate login off, Fiat off; NetworkPolicy as in spike 2 plus the Tailscale proxy pods; MySQL and Redis in the cluster (upstream test password replaced by a generated Secret from `bootstrap-secrets.sh`, a small idp-infra change). Merging this deploys Spinnaker at the next `make up` (about 4 GiB, a second node).
+2. **idp-gitops: `spinnaker-admin` Tailscale Ingress** for Deck and Gate under one host (Deck at `/`, Gate at `/api/v1`, as upstream's `ingress.yaml`), Deck settings pointing at that host, `spinnaker-admin` added to the tailscale-cleanup list in idp-infra. Same pattern as `vault-admin-access`.
+3. **idp-portal operator** (Sonnet writes, Opus reviews): (a) the `WorkloadIdentity` HTTPRoute gets a backend: Service `<workload>` port 80 in the same namespace (convention; the golden-path template creates that Service); the admission policy pin changes with it; (b) each `TeamNamespace` gets a Role `spinnaker-deployer` (deployments, services; read on replicasets, pods, events) and a RoleBinding to the Clouddriver ServiceAccount, behind a flag, also pinned by the admission policy.
+4. **Sample app** (new public repo, name to confirm, default `sample-orders-api`): a tiny Go HTTP service; `GET /` returns 200 and whether the env var from the portal secret is set (never its value); Kustomize `deploy/base` (Deployment with the workload's ServiceAccount and label, `envFrom` the secret, Service `<workload>:80`, readOnlyRootFilesystem, non-root); a GitHub Actions workflow builds the image and pushes to GHCR, printing the digest.
+5. **Hand-made pipeline script** (`idp-infra/scripts/spinnaker-demo-pipeline.sh`, dry run by default, run by the human): creates the Spinnaker application and a bake (Kustomize from the sample repo) plus deploy pipeline for the demo namespace, from templates in the sample repo or idp-gitops; takes the image digest as a parameter.
+6. **First run (human)**: order namespace `demo` (name to confirm) and a workload `orders` in the portal, add the secret on the Secrets page, `make up`, run the script, trigger the pipeline, open `https://orders.demo.apps.ithaca-idp.com` (the certificate needs about 5 minutes after the namespace exists), open Deck over Tailscale. Expect to debug the ingress-to-pod path (the NetworkPolicy allow on TCP 15008 and the ambient policy have never carried real traffic, see `IDP_NOTES.md` "Not proven").
+
+## Defaults chosen unless the user says otherwise
+
+Demo namespace `demo`, workload `orders`, hostname `orders.demo.apps.ithaca-idp.com`; sample repo `sample-orders-api` (public, same hygiene set as the other repos); GHCR instead of Artifact Registry for this milestone.
+
+## Not in this milestone
+
+`DeliveryPipeline` CRD, controller, portal page, deploy-request CR, per-user Deck access (deferred, ADR 0011), spike 3, mesh-identity pinning of the controller, image signing and Kyverno, golden-path GitHub workflow for tenants (Order #05).
