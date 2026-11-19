@@ -14,8 +14,11 @@
 #
 # The image is NOT a parameter: the app repo's deploy/base names its image by digest (the CI workflow prints it), and
 # --ref should be a commit SHA or a branch the Rosco bake can fetch (public repos only, anonymous account public-git).
-# Application name (unverified until the first run: Spinnaker is believed to allow letters, digits, underscore and dot): "<namespace>_<workload>" with
-# hyphens turned into underscores. Pipeline name: deploy.
+# Application name: "<namespace>-<workload>". Spinnaker requires ^[a-zA-Z][a-zA-Z0-9-]*$ for the kubernetes provider (underscores
+# are refused: found on the first run, 2026-11-19) and fewer than 63 characters, so the namespace must start with a letter.
+# The join is ambiguous in theory (a-b + c versus a + b-c): this milestone-1 script does not guard against that (the
+# DeliveryPipeline controller of milestone 2 will).
+# Pipeline name: deploy.
 # Needs curl and jq. Bash 3.2 compatible. Run by the human, never by the agent (it changes cluster state through Gate).
 set -euo pipefail
 set +x
@@ -46,7 +49,9 @@ case "$NS$WL$ACCOUNT" in *[!a-z0-9-]*) die "namespace, workload and account must
 case "$REPO" in https://github.com/*) ;; *) die "--repo must be a public https://github.com/... repository" ;; esac
 case "$KPATH" in /* | *..*) die "--path must be a relative path without .." ;; esac
 
-APP="$(printf '%s_%s' "$NS" "$WL" | tr '-' '_')"
+case "$NS" in [a-z]*) ;; *) die "the namespace must start with a letter (Spinnaker application names do)" ;; esac
+APP="$NS-$WL"
+[ "${#APP}" -lt 63 ] || die "application name $APP is too long (63 characters at most)"
 
 pipeline="$(jq -n --arg app "$APP" --arg ns "$NS" --arg acct "$ACCOUNT" --arg repo "$REPO" --arg ref "$REF" --arg path "$KPATH" '
   { application: $app, name: "deploy", keepWaitingPipelines: false, limitConcurrent: true, expectedArtifacts: [], triggers: [],
