@@ -29,6 +29,19 @@ SM_CLIENT_SECRET="${TS_OAUTH_CLIENT_SECRET_SECRET:-tailscale-oauth-client-secret
 
 die() { printf 'bootstrap-secrets: %s\n' "$*" >&2; exit 1; }
 
+# ensure_namespace <name>: Argo CD creates some of these namespaces too (CreateNamespace=true) while this script runs,
+# and `kubectl apply` is check-then-create, so it can lose the race with AlreadyExists even though the namespace
+# is exactly what we want. Check, create, and re-check; give up only if the namespace still does not exist.
+ensure_namespace() {
+  local ns="$1" attempt
+  for attempt in 1 2 3; do
+    kubectl get namespace "$ns" >/dev/null 2>&1 && return 0
+    kubectl create namespace "$ns" >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  kubectl get namespace "$ns" >/dev/null 2>&1 || die "could not create namespace $ns"
+}
+
 for tool in gcloud kubectl; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool not found on PATH"
 done
@@ -64,8 +77,7 @@ gcloud container clusters get-credentials "$CLUSTER" --dns-endpoint --zone "$ZON
 
 # Argo CD also creates this namespace (CreateNamespace=true); whichever runs first wins.
 # No istio.io/dataplane-mode label here: the operator and its proxies stay outside the ambient mesh.
-kubectl create namespace "$TS_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
-  || die "could not create namespace $TS_NAMESPACE"
+ensure_namespace "$TS_NAMESPACE"
 
 # The dry-run output contains the (base64) values, so it only ever goes through the pipe.
 kubectl -n "$TS_NAMESPACE" create secret generic "$TS_K8S_SECRET" \
@@ -102,8 +114,7 @@ for s in lldap-admin-password lldap-jwt-secret lldap-key-seed keycloak-admin-pas
   read_secret "$s" "$tmp/$s"
 done
 
-kubectl create namespace "$ID_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
-  || die "could not create namespace $ID_NAMESPACE"
+ensure_namespace "$ID_NAMESPACE"
 
 # apply_secret <k8s-name> <key>=<file>...  (dry-run output holds base64 values: pipe only)
 apply_secret() {
@@ -145,8 +156,7 @@ echo "bootstrap-secrets ok: Secrets $ID_NAMESPACE/{lldap,keycloak-admin,keycloak
 # The portal decodes SESSION_KEY as base64; the 64-char hex value is valid base64 text and
 # decodes to 48 random bytes, so the same generator is reused.
 PORTAL_NAMESPACE="${PORTAL_NAMESPACE:-idp-system}"
-kubectl create namespace "$PORTAL_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
-  || die "could not create namespace $PORTAL_NAMESPACE"
+ensure_namespace "$PORTAL_NAMESPACE"
 kubectl -n "$PORTAL_NAMESPACE" create secret generic portal-session \
   --from-file=session-key="$tmp/portal-session-key" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
   || die "could not create or update Secret $PORTAL_NAMESPACE/portal-session"
