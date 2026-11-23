@@ -1,6 +1,6 @@
 # 0011. Tenant delivery with Spinnaker (Order #04 `DeliveryPipeline`)
 
-- Status: proposed; spikes of 2026-11-10 and 2026-11-13 ran on GKE and settled most open points (see "Spike results" and "Spike 2 results"); the Gate auth model is decided (network-isolated, Fiat off); the Kubernetes account model (option A or B) is still open
+- Status: accepted and partly built. Milestone 1 (a first app through Spinnaker) and the milestone 2 backend (`DeliveryPipeline`/`DeliveryRun` CRDs, the `idp-delivery` controller, the gitops wiring) are proven on GKE; the portal Pipelines page is merged but not yet run on a cluster (see "Milestone 1 and 2 as built"). The Gate auth model is decided (network-isolated, Fiat off); the Kubernetes account model (option A or B) is still open (spike 3)
 - Date: 2026-11-10
 
 ## Context
@@ -107,3 +107,35 @@ Same install as spike 1, plus: Gate login off (`SECURITY_BASICFORM_ENABLED=false
 4. `idp-golden-paths` repo: pipeline template and the Kustomize base.
 5. `idp-portal`: `DeliveryPipeline` CRD, controller, admission policy, portal page behind a flag.
 6. Proof script (like `resource-proof.sh`) and `verify.sh` smoke check.
+
+## Milestone 1 and 2 as built (2026-11-14 to 2026-11-23)
+
+What was built, where it differs from the decisions above, and what is still open. Runbook: `docs/order-04-first-run.md`.
+
+**Built and proven on GKE.**
+- Milestone 1 (2026-11-19, rerun 2026-11-20): Spinnaker through Argo CD, a sample app deployed by a pipeline, reachable through its tenant route.
+- Milestone 2 backend (idp-portal #53, idp-gitops #57, proven 2026-11-22): CRDs `DeliveryPipeline` (named after its workload) and `DeliveryRun` (a 40-hex commit), the separate `idp-delivery` controller as the only Gate caller, admission policies `idp-delivery-writers` and `idp-delivery-scope`. A hand-written pipeline went READY and a run SUCCEEDED; creating the CRs as your own admin identity was refused, as designed.
+- Not yet run on a cluster: the portal API and Pipelines page (idp-portal #54, idp-gitops #58, flag `PIPELINES_ENABLED`).
+
+**Differences from the decisions above.**
+- The pipeline template lives in the controller (Go template, namespace and workload baked in), not in a separate `idp-golden-paths` repo. The Kustomize base is the app repo's own `deploy/base`.
+- One Spinnaker account per tenant namespace, loaded at start-up (a Clouddriver restart after a namespace appears, option A). Option B (spike 3) is still untested.
+- Deploy is by commit SHA. The image digest is pinned inside the app repo's manifests, not passed by the trigger.
+- The Deploy stage sets `skipExpressionEvaluation: true` (a security review finding: Orca evaluates SpEL in baked manifests, so `${#fromUrl(...)}` in a tenant manifest would be a blind request from Orca into Gate and Clouddriver). Only the Bake stage evaluates expressions (it needs `${parameters.ref}`), and it sees only the controller-validated SHA.
+- The controller refuses any Spinnaker application it did not create (marker in the application description, `idp-managed namespace=<ns> workload=<wl>`). It does not adopt or stamp existing applications.
+
+**Decision (2026-11-20): the controller is pinned to Gate by labels, not by mesh identity. Accepted risk.**
+- The default-deny NetworkPolicy in `spinnaker` allows Gate (8084) only from pods labelled `app.kubernetes.io/name=idp-delivery` in `idp-system`. Gate has no authentication, so whoever reaches it is a Spinnaker admin.
+- The mesh-identity pin planned above was not built. Neither `spinnaker` nor `idp-system` is in the ambient mesh, so an AuthorizationPolicy would not be enforced, and joining the mesh would change the Tailscale admin path and Spinnaker's own calls without a way to prove either keeps working. The Opus review of the gitops slice judged it not worth doing now: the effort is better spent on real Gate authentication.
+- Compensating control: the ValidatingAdmissionPolicy `idp-delivery-pod-identity` denies any pod carrying that label unless it runs in `idp-system` as ServiceAccount `idp-delivery` (and the reverse), so the label cannot be put on an arbitrary pod. It is `failurePolicy: Fail` and was reviewed by reading only.
+- Who can still reach Gate: Argo CD and cluster admins (the same trust level as the controller). Anyone with `pods/exec` or `pods/ephemeralcontainers` in `idp-system` can run code in the controller's own pod and reach Gate; no admission policy on pods can stop that, so that RBAC must stay with platform admins.
+- Exit criterion: Gate OIDC through Keycloak with Fiat (see "Developer access to their pipelines"), at which point the label pin becomes defence in depth.
+
+**Break-glass and how to create the CRs by hand.** `idp-delivery-writers` lets only portal-api, `idp-delivery` and `system:masters` create or update the two kinds. GKE IAM admins are not `system:masters`, so an admin impersonates the portal's ServiceAccount: `kubectl --as=system:serviceaccount:idp-system:portal-api create -f ...` (the portal's own admission policy then still applies). Delete is left to RBAC so namespace deletion works. A garbage-collector orphan-delete patch by a non-writer would be denied.
+
+**Known limits and follow-ups (not scheduled).**
+- Application name `<namespace>-<workload>` is ambiguous (`a-b` + `c` against `a` + `b-c`). The marker stops one namespace taking over another's application but not the refusal of the real owner, so a member can squat a name another namespace would need. Real fix: a hash suffix in the application name (breaks the milestone 1 naming).
+- Rosco egress is open. A tenant's `kustomization.yaml` can pull remote bases from any host, which bypasses the repository organisation allowlist (the allowlist only checks `spec.repo`). To do: lock Rosco egress to github.com (GKE Dataplane V2 FQDN network policy, feasibility not confirmed on this cluster) and disable Kustomize remote loads in the bake. Orca SpEL URL restrictions as a second layer.
+- A commit that exists only in another fork of an allowed repository may resolve under it; check the SHA is reachable from an allowed branch.
+- The run cap of 100 per namespace is counted in the portal process only. A server-side `ResourceQuota` `count/deliveryruns.idp.ithaca-idp.com` per tenant namespace is the sturdier cap. The portal cannot delete runs; nothing cleans old `DeliveryRun`s, and deleting a `DeliveryPipeline` does not delete its Spinnaker application.
+- The repository allowlist is per organisation, not per team; the controller's `events` permission is cluster-wide; a crash between triggering and the status write cannot start a run twice (RUNNING is written first, and an interrupted run fails), but it also cannot resume.
